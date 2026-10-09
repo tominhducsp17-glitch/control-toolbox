@@ -1,0 +1,12 @@
+# Node "trajectory" (openarm_trajectory). Read once at start; edit and restart, no rebuild needed.
+/**/trajectory:
+  ros__parameters:
+    trajectory_file: ""                 # set by the launch file (default: share/openarm_trajectory/trajectories/tissue_wipe_x2.csv)
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+                  openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    rate_hz: 400.0                      # joint_commands rate
+    approach_speed: 0.25                # peak speed of the approach/return quintics [rad/s]
+    min_move_s: 2.0                     # minimum duration of the approach/return [s]
+    return_to_start: true               # after the file: return to the measured start pose and hold
+    state_topic: joint_states
+    command_topic: joint_commands
