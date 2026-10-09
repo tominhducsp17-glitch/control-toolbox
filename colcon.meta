@@ -1,0 +1,18 @@
+{
+  "names": {
+    "ct_core": {
+      "cmake-args": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_EXAMPLES=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_Python=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_PythonLibs=ON"
+      ]
+    },
+    "ct_optcon": {
+      "cmake-args": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_EXAMPLES=ON"
+      ]
+    }
+  }
+}

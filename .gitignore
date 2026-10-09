@@ -42,3 +42,7 @@ solution.mat
 
 */build/*
 !ct_doc/doc/html/ct_doc_placeholder.txt
+build/
+install/
+log/
+__pycache__/
