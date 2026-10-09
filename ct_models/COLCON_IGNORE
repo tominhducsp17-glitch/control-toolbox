@@ -1,0 +1,1 @@
+openarm-ctc branch: not built by colcon (needs kindr + RobCoGen models; OpenArm uses Pinocchio)
