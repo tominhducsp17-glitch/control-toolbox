@@ -1,17 +1,19 @@
-// Node 2 "controller": calls the openarm_control library (control-toolbox interface) and outputs tau_ff.
+// Node 2 "controller": builds the common controller input, calls the openarm_control library and
+// outputs tau_ff.
 //
-//   in : joint_states   (sensor_msgs/JointState)  measured position/velocity (+ finger positions)
+//   in : joint_states   (sensor_msgs/JointState)  measured position/velocity
 //   in : joint_commands (sensor_msgs/JointState)  position = q_target, velocity = dq_target
 //   out: controller/tau_ff (sensor_msgs/JointState) effort = tau_ff [N m] for the joints of the command,
 //        stamped with the command's stamp
 //
-// One output per received command (event driven). ddq_target is estimated from dq_target. Joints of
-// joint_names that a command does not contain (e.g. the other arm) are held at their measured position
-// with zero velocity inside the model and get no output. The controller is chosen by controller_type
-// through openarm_control::makeTrackingController; the node only uses ct::core::Controller::computeControl.
-#include <openarm_control/tracking_controller.hpp>
+// Each received command (event driven):
+//   1. common input: measured q, dq; reference q_d, dq_d and ddq_d (estimated from dq_d)
+//   2. model terms M, C, G at the measured and at the reference state (generated code, OpenArmModel)
+//   3. tau = controller->compute(input)   (virtual ControllerBase, chosen by controller_type)
+// Joints of joint_names that a command does not contain (e.g. the other arm) are held at their
+// measured position with zero velocity and get no output.
+#include <openarm_control/controller.hpp>
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
@@ -53,7 +55,6 @@ public:
       required(*this, "acceleration_cutoff_hz", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double(),
       required(*this, "max_abs_acceleration", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double());
     for (const auto & [name, type] : std::vector<std::pair<std::string, rclcpp::ParameterType>>{
-        {"urdf_path", rclcpp::ParameterType::PARAMETER_STRING},
         {"controller_type", rclcpp::ParameterType::PARAMETER_STRING},
         {"torque_limit", rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY},
         {"input_timeout_s", rclcpp::ParameterType::PARAMETER_DOUBLE},
@@ -63,15 +64,9 @@ public:
     {
       required(*this, name, type);
     }
-    openarm_control::TrackingControllerConfig config;
-    config.urdf_path = get_parameter("urdf_path").as_string();
-    if (config.urdf_path.empty()) {
-      config.urdf_path = ament_index_cpp::get_package_share_directory("openarm_control") + "/urdf/openarm_v1_bimanual.urdf";
-    }
-    config.joint_names = joints_;
-    config.torque_limit = get_parameter("torque_limit").as_double_array();
-    const auto type = get_parameter("controller_type").as_string();
-    controller_ = openarm_control::makeTrackingController<NJ>(type, config);
+    model_ = std::make_unique<openarm_control::OpenArmModel<NJ>>(joints_);
+    controller_ = openarm_control::makeController<NJ>(get_parameter("controller_type").as_string());
+    controller_->setTorqueLimit(get_parameter("torque_limit").as_double_array());
     timeout_s_ = get_parameter("input_timeout_s").as_double();
     for (std::size_t j = 0; j < NJ; ++j) {index_[joints_[j]] = j;}
     q_meas_.setZero();
@@ -86,8 +81,8 @@ public:
       get_parameter("command_topic").as_string(), rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::JointState & m) {onCommand(m);});
     watchdog_ = create_wall_timer(std::chrono::milliseconds(10), [this] {onWatchdog();});
-    RCLCPP_INFO(get_logger(), "controller '%s' (ct::core::Controller<%zu, %zu>), %zu joints, URDF %s",
-      controller_->name().c_str(), 2 * NJ, NJ, NJ, config.urdf_path.c_str());
+    RCLCPP_INFO(get_logger(), "controller '%s', %zu joints, model: generated code (M, C, G)",
+      controller_->name().c_str(), NJ);
   }
 
 private:
@@ -96,10 +91,7 @@ private:
     if (msg.position.size() != msg.name.size()) {return;}
     for (std::size_t k = 0; k < msg.name.size(); ++k) {
       const auto it = index_.find(msg.name[k]);
-      if (it == index_.end()) {
-        controller_->setPassiveJointPosition(msg.name[k], msg.position[k]);  // fingers
-        continue;
-      }
+      if (it == index_.end()) {continue;}  // fingers: fixed at 0 in the generated model
       if (!std::isfinite(msg.position[k])) {continue;}
       q_meas_[it->second] = msg.position[k];
       dq_meas_[it->second] = msg.velocity.size() == msg.name.size() ? msg.velocity[k] : 0.0;
@@ -117,14 +109,16 @@ private:
     if (!has_velocity) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "joint_commands without velocity; dq_target = 0");
     }
-    openarm_control::JointReference<NJ> ref;
-    ref.q = q_meas_;  // joints without a command hold their measured pose
+    openarm_control::ControllerInput<NJ> in;
+    in.q = q_meas_;
+    in.dq = dq_meas_;
+    in.q_d = q_meas_;  // joints without a command hold their measured pose
     std::vector<std::size_t> commanded;
     for (std::size_t k = 0; k < msg.name.size(); ++k) {
       const auto it = index_.find(msg.name[k]);
       if (it == index_.end()) {continue;}
-      ref.q[it->second] = msg.position[k];
-      ref.dq[it->second] = has_velocity ? msg.velocity[k] : 0.0;
+      in.q_d[it->second] = msg.position[k];
+      in.dq_d[it->second] = has_velocity ? msg.velocity[k] : 0.0;
       commanded.push_back(it->second);
     }
     if (commanded.empty()) {return;}
@@ -138,13 +132,11 @@ private:
     }
     const bool stamped = msg.header.stamp.sec != 0 || msg.header.stamp.nanosec != 0;
     const double t = stamped ? rclcpp::Time(msg.header.stamp).seconds() : now().seconds();
-    ref.ddq = estimator_->update(t, ref.dq);
+    in.t = t;
+    in.ddq_d = estimator_->update(t, in.dq_d);
     try {
-      controller_->setReference(ref);
-      openarm_control::State<NJ> x;
-      x << q_meas_, dq_meas_;
-      openarm_control::Torque<NJ> u;
-      controller_->computeControl(x, t, u);  // ct::core::Controller interface
+      openarm_control::computeModelTerms(*model_, in);   // M, C, G at measured and reference state
+      const JointVector<NJ> u = controller_->compute(in);  // virtual ControllerBase
       sensor_msgs::msg::JointState out;
       out.header.stamp = stamped ? msg.header.stamp : builtin_interfaces::msg::Time(now());
       for (const auto j : commanded) {
@@ -172,7 +164,8 @@ private:
 
   std::vector<std::string> joints_;
   std::map<std::string, std::size_t> index_;
-  std::unique_ptr<openarm_control::JointTrackingController<NJ>> controller_;
+  std::unique_ptr<openarm_control::OpenArmModel<NJ>> model_;
+  std::unique_ptr<openarm_control::ControllerBase<NJ>> controller_;
   std::unique_ptr<openarm_control::AccelerationEstimator<NJ>> estimator_;
   JointVector<NJ> q_meas_, dq_meas_;
   std::array<bool, NJ> measured_{};
