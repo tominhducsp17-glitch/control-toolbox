@@ -1,0 +1,22 @@
+<package format="2">
+  <name>ct_nlc</name>
+  <version>3.0.2</version>
+  <description>
+    Control toolbox - nonlinear controller module: model-based joint-space controllers
+    (computed-torque control, gravity compensation) as ct::core::Controller.
+  </description>
+  <license>BSD-2</license>
+
+  <author>To Minh Duc</author>
+  <maintainer email="tominhducsp17@gmail.com">To Minh Duc</maintainer>
+
+  <buildtool_depend>cmake</buildtool_depend>
+  <depend>ct_core</depend>
+  <test_depend>ct_models</test_depend>  <!-- OpenArm model for the examples and tests -->
+
+  <exec_depend>catkin</exec_depend>  <!-- ROS compatibility-->
+
+  <export>    <!-- Specify that this is not a ROS package-->
+    <build_type>cmake</build_type>
+  </export>
+</package>
