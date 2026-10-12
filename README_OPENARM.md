@@ -16,7 +16,7 @@ NLOC, MPC, DMS) and can use them directly. The upstream `README.md` is unchanged
 | `openarm/openarm_control` | OpenArm | library, no node, **no Pinocchio at run time**: generated model (`generated/`: M, C, G per arm), `OpenArmModel`, `OpenArmDynamics` (`ct::core::ControlledSystem`), virtual `ControllerBase` with one common input, `ctc_feedforward`, `gravity_compensation`, `CtControllerAdapter` (`ct::core::Controller`) |
 | `openarm/openarm_trajectory` | OpenArm | node `trajectory_node`: plays a trajectory, publishes `joint_commands` (q, dq) |
 | `openarm/openarm_controller` | OpenArm | node `controller_node`: calls the library, publishes `controller/tau_ff`; launch file |
-| `scripts/install_deps_ubuntu22.sh`, `docker/Dockerfile` | OpenArm | Ubuntu 22.04: ROS 2 Humble + Pinocchio + IPOPT + the toolbox dependencies pinned as in `ct/install_cppadcg.sh` and `ct/install_hpipm.sh` (CppAD 20200000.3, CppADCodeGen v2.4.3, BLASFEO 0.1.2, HPIPM 0.1.3) |
+| `ct/install_deps_ubuntu22.sh` | OpenArm | Ubuntu 22.04: ROS 2 Humble + Pinocchio + IPOPT + the toolbox dependencies pinned as in `ct/install_cppadcg.sh` and `ct/install_hpipm.sh` (CppAD 20200000.3, CppADCodeGen v2.4.3, BLASFEO 0.1.2, HPIPM 0.1.3) + kindr 1.2.0 |
 | `colcon.meta` | OpenArm | builds `ct_core` and `ct_optcon` with their examples; Python plotting of `ct_core` off (its matplotlib bridge fails with matplotlib ≥ 3.5, and the runtime stays Python-free) |
 | `ct_core/CMakeLists.txt` | upstream, **1 fix** | `"${Python_VERSION_MAJOR}"` quoted so CMake configures when Python is disabled |
 
@@ -69,10 +69,10 @@ the model once per cycle and calls `controller->compute(in)`.
 
 ## Build and test
 
-Ubuntu 22.04 (same as the integration side), no Docker needed:
+Ubuntu 22.04 (same as the integration side):
 
 ```bash
-./scripts/install_deps_ubuntu22.sh   # ROS 2 Humble + all toolbox/OpenArm dependencies (pinned versions)
+./ct/install_deps_ubuntu22.sh        # ROS 2 Humble + all toolbox/OpenArm dependencies (pinned versions)
 source /opt/ros/humble/setup.bash
 colcon build                        # from the repository root; colcon.meta sets the toolbox options
 colcon test && colcon test-result --verbose
@@ -80,8 +80,6 @@ colcon test && colcon test-result --verbose
 
 Checked on Ubuntu 22.04 (image built by the script): `colcon build` (6 packages), 11/11 tests, all 11 toolbox examples.
 
-Any other host: `docker build -t openarm_toolbox:humble-ct -f docker/Dockerfile .` (runs the same script), then the same commands inside
-`docker run --rm -it -v $PWD:/ws -w /ws openarm_toolbox:humble-ct bash`.
 
 ## Run
 

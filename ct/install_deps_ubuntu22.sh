@@ -4,10 +4,11 @@
 # ct/install_cppadcg.sh and ct/install_hpipm.sh, and the OpenArm package dependencies.
 #
 #   sudo apt-get update && sudo apt-get install -y git
-#   ./scripts/install_deps_ubuntu22.sh          # then:
+#   ./ct/install_deps_ubuntu22.sh               # then, from the repository root:
 #   source /opt/ros/humble/setup.bash && colcon build && colcon test
 #
-# Safe to run again: steps that are already done are skipped. docker/Dockerfile runs this same script.
+# Safe to run again: steps that are already done are skipped. Same role as ct/install_deps.sh,
+# ct/install_cppadcg.sh and ct/install_hpipm.sh, for Ubuntu 22.04 + ROS 2 Humble + colcon.
 set -euo pipefail
 
 SUDO=""
@@ -67,6 +68,14 @@ if [[ ! -d /opt/hpipm ]]; then
   git -C hpipm checkout -q 0.1.3
   cmake -S hpipm -B hpipm-build -DHPIPM_TESTING=OFF
   $SUDO cmake --build hpipm-build --target install -j"$(nproc)"
+fi
+echo "== 5. kindr 1.2.0 (kinematics/dynamics types used by ct_rbd and ct_models)"
+if [[ ! -d /usr/local/include/kindr ]]; then
+  cd "$BUILD_DIR"
+  git clone -q https://github.com/ANYbotics/kindr.git
+  git -C kindr checkout -q 1.2.0
+  cmake -S kindr -B kindr-build -DUSE_CMAKE=true -DBUILD_TEST=OFF
+  $SUDO cmake --build kindr-build --target install
 fi
 $SUDO ldconfig
 
