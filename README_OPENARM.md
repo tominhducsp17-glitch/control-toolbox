@@ -115,6 +115,10 @@ colcon build                         # from the repository root; colcon.meta set
 colcon test && colcon test-result --verbose
 ```
 
+Checked on a fresh clone of this branch in Ubuntu 22.04 (system set up by the script): 7 packages build, all
+tests pass (ct_models incl. upstream HyA/IKFast/Quadrotor tests, ct_nlc, launch test of both nodes), the 11
+`ct_optcon` examples and `ex_OpenArmComputedTorque` run to the end.
+
 ## Run
 
 ```bash
