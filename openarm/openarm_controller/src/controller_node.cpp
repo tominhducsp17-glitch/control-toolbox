@@ -1,5 +1,5 @@
-// Node 2 "controller": builds the common controller input, calls the openarm_control library and
-// outputs tau_ff.
+// Node 2 "controller": calls a ct_nlc controller (ct::core::Controller with the generated OpenArm
+// model of ct_models) and outputs tau_ff.
 //
 //   in : joint_states   (sensor_msgs/JointState)  measured position/velocity
 //   in : joint_commands (sensor_msgs/JointState)  position = q_target, velocity = dq_target
@@ -7,12 +7,13 @@
 //        stamped with the command's stamp
 //
 // Each received command (event driven):
-//   1. common input: measured q, dq; reference q_d, dq_d and ddq_d (estimated from dq_d)
-//   2. model terms M, C, G at the measured and at the reference state (generated code, OpenArmModel)
-//   3. tau = controller->compute(input)   (virtual ControllerBase, chosen by controller_type)
+//   1. reference q_d, dq_d and ddq_d (estimated from dq_d): controller->setReference()
+//   2. state x = [q; dq] measured: controller->computeControl(x, t, u)   (override in each controller,
+//      which evaluates M, C, G with its model; chosen by controller_type)
 // Joints of joint_names that a command does not contain (e.g. the other arm) are held at their
 // measured position with zero velocity and get no output.
-#include <openarm_control/controller.hpp>
+#include <ct/models/OpenArm/OpenArm.h>
+#include <ct/nlc/nlc.h>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -26,7 +27,25 @@
 #include <string>
 #include <vector>
 
-using openarm_control::JointVector;
+template<size_t NJ>
+using JointVector = Eigen::Matrix<double, NJ, 1>;
+template<size_t NJ>
+using Model = ct::models::OpenArm::OpenArmModel<NJ>;
+template<size_t NJ>
+using Controller = ct::nlc::ModelBasedJointController<NJ, Model<NJ>>;
+
+// controller_type -> controller. Register new ct_nlc controllers here.
+template<size_t NJ>
+std::unique_ptr<Controller<NJ>> makeController(const std::string & type, const Model<NJ> & model)
+{
+  if (type == "ctc_feedforward") {  // M(q_d) ddq_d + C(q_d, dq_d) dq_d + G(q_d)
+    return std::make_unique<ct::nlc::ComputedTorqueController<NJ, Model<NJ>>>(model);
+  }
+  if (type == "gravity_compensation") {  // G(q_d)
+    return std::make_unique<ct::nlc::GravityCompensationController<NJ, Model<NJ>>>(model);
+  }
+  throw std::invalid_argument("unknown controller_type '" + type + "' (ctc_feedforward | gravity_compensation)");
+}
 
 // Declares a parameter without a default and returns it; throws a clear error when the YAML lacks it.
 rclcpp::Parameter required(rclcpp::Node & node, const std::string & name, rclcpp::ParameterType type)
@@ -51,7 +70,7 @@ public:
     // Every parameter comes from the YAML loaded at start (config/controller.yaml); none has a
     // default in the code, so changing a value never needs a rebuild.
     required(*this, "joint_names", rclcpp::ParameterType::PARAMETER_STRING_ARRAY);
-    estimator_ = std::make_unique<openarm_control::AccelerationEstimator<NJ>>(
+    estimator_ = std::make_unique<ct::nlc::ReferenceAccelerationEstimator<NJ>>(
       required(*this, "acceleration_cutoff_hz", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double(),
       required(*this, "max_abs_acceleration", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double());
     for (const auto & [name, type] : std::vector<std::pair<std::string, rclcpp::ParameterType>>{
@@ -64,9 +83,11 @@ public:
     {
       required(*this, name, type);
     }
-    model_ = std::make_unique<openarm_control::OpenArmModel<NJ>>(joints_);
-    controller_ = openarm_control::makeController<NJ>(get_parameter("controller_type").as_string());
-    controller_->setTorqueLimit(get_parameter("torque_limit").as_double_array());
+    type_ = get_parameter("controller_type").as_string();
+    controller_ = makeController<NJ>(type_, Model<NJ>(joints_));
+    const auto limit = get_parameter("torque_limit").as_double_array();
+    if (limit.size() != NJ) {throw std::invalid_argument("torque_limit must have one value per joint");}
+    controller_->setTorqueLimit(Eigen::Map<const JointVector<NJ>>(limit.data()));
     timeout_s_ = get_parameter("input_timeout_s").as_double();
     for (std::size_t j = 0; j < NJ; ++j) {index_[joints_[j]] = j;}
     q_meas_.setZero();
@@ -81,8 +102,8 @@ public:
       get_parameter("command_topic").as_string(), rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::JointState & m) {onCommand(m);});
     watchdog_ = create_wall_timer(std::chrono::milliseconds(10), [this] {onWatchdog();});
-    RCLCPP_INFO(get_logger(), "controller '%s', %zu joints, model: generated code (M, C, G)",
-      controller_->name().c_str(), NJ);
+    RCLCPP_INFO(get_logger(), "controller '%s' (ct_nlc), %zu joints, model: ct_models OpenArm (generated code)",
+      type_.c_str(), NJ);
   }
 
 private:
@@ -109,16 +130,14 @@ private:
     if (!has_velocity) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "joint_commands without velocity; dq_target = 0");
     }
-    openarm_control::ControllerInput<NJ> in;
-    in.q = q_meas_;
-    in.dq = dq_meas_;
-    in.q_d = q_meas_;  // joints without a command hold their measured pose
+    JointVector<NJ> q_d = q_meas_;  // joints without a command hold their measured pose
+    JointVector<NJ> dq_d = JointVector<NJ>::Zero();
     std::vector<std::size_t> commanded;
     for (std::size_t k = 0; k < msg.name.size(); ++k) {
       const auto it = index_.find(msg.name[k]);
       if (it == index_.end()) {continue;}
-      in.q_d[it->second] = msg.position[k];
-      in.dq_d[it->second] = has_velocity ? msg.velocity[k] : 0.0;
+      q_d[it->second] = msg.position[k];
+      dq_d[it->second] = has_velocity ? msg.velocity[k] : 0.0;
       commanded.push_back(it->second);
     }
     if (commanded.empty()) {return;}
@@ -132,11 +151,12 @@ private:
     }
     const bool stamped = msg.header.stamp.sec != 0 || msg.header.stamp.nanosec != 0;
     const double t = stamped ? rclcpp::Time(msg.header.stamp).seconds() : now().seconds();
-    in.t = t;
-    in.ddq_d = estimator_->update(t, in.dq_d);
     try {
-      openarm_control::computeModelTerms(*model_, in);   // M, C, G at measured and reference state
-      const JointVector<NJ> u = controller_->compute(in);  // virtual ControllerBase
+      controller_->setReference(q_d, dq_d, estimator_->update(t, dq_d));
+      ct::core::StateVector<2 * NJ> x;
+      x << q_meas_, dq_meas_;
+      ct::core::ControlVector<NJ> u;
+      controller_->computeControl(x, t, u);  // override of ct::core::Controller
       sensor_msgs::msg::JointState out;
       out.header.stamp = stamped ? msg.header.stamp : builtin_interfaces::msg::Time(now());
       for (const auto j : commanded) {
@@ -146,7 +166,7 @@ private:
       tau_pub_->publish(out);
       last_command_ = now();
       timed_out_ = false;
-      if (controller_->lastClamped()) {
+      if (controller_->lastControlSaturated()) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "tau_ff clamped by torque_limit");
       }
     } catch (const std::invalid_argument & e) {
@@ -164,9 +184,9 @@ private:
 
   std::vector<std::string> joints_;
   std::map<std::string, std::size_t> index_;
-  std::unique_ptr<openarm_control::OpenArmModel<NJ>> model_;
-  std::unique_ptr<openarm_control::ControllerBase<NJ>> controller_;
-  std::unique_ptr<openarm_control::AccelerationEstimator<NJ>> estimator_;
+  std::string type_;
+  std::unique_ptr<Controller<NJ>> controller_;
+  std::unique_ptr<ct::nlc::ReferenceAccelerationEstimator<NJ>> estimator_;
   JointVector<NJ> q_meas_, dq_meas_;
   std::array<bool, NJ> measured_{};
   double timeout_s_;

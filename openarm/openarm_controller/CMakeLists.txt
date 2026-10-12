@@ -12,11 +12,12 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(openarm_control REQUIRED)
+find_package(ct_nlc REQUIRED)     # controllers (ct::core::Controller)
+find_package(ct_models REQUIRED)  # OpenArm model (generated code)
 
-# Node "controller": calls the openarm_control library (control-toolbox interface), outputs tau_ff.
+# Node "controller": calls a ct_nlc controller with the ct_models OpenArm model, outputs tau_ff.
 add_executable(controller_node src/controller_node.cpp)
-target_link_libraries(controller_node openarm_control::openarm_control)
+target_link_libraries(controller_node ct_nlc OpenArmModel)
 ament_target_dependencies(controller_node rclcpp sensor_msgs)
 install(TARGETS controller_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})

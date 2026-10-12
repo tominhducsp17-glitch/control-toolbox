@@ -5,7 +5,7 @@
                   openarm_left_joint5, openarm_left_joint6, openarm_left_joint7,
                   openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
                   openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
-    controller_type: ctc_feedforward    # ctc_feedforward | gravity_compensation (openarm_control::makeController)
+    controller_type: ctc_feedforward    # ctc_feedforward | gravity_compensation (ct_nlc controllers, see controller_node.cpp makeController)
     torque_limit: [15.0, 15.0, 10.0, 10.0, 3.0, 3.0, 3.0, 15.0, 15.0, 10.0, 10.0, 3.0, 3.0, 3.0]
     acceleration_cutoff_hz: 5.0         # low-pass of ddq_target estimated from dq_target
     max_abs_acceleration: 20.0

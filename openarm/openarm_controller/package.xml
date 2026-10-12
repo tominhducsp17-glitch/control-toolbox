@@ -3,14 +3,15 @@
 <package format="3">
   <name>openarm_controller</name>
   <version>0.1.0</version>
-  <description>Node "controller": calls the openarm_control library through the control-toolbox Controller interface and publishes tau_ff. Launch file for the trajectory + controller pipeline.</description>
+  <description>Node "controller": calls a ct_nlc controller (ct::core::Controller) with the ct_models OpenArm model and publishes tau_ff. Launch file for the trajectory + controller pipeline.</description>
   <maintainer email="tominhducsp17@gmail.com">To Minh Duc</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
-  <depend>openarm_control</depend>
+  <depend>ct_nlc</depend>
+  <depend>ct_models</depend>
   <exec_depend>openarm_trajectory</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>

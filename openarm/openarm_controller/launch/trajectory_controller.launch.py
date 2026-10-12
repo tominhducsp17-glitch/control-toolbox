@@ -1,4 +1,4 @@
-"""Start node "trajectory" (q, dq reference) and node "controller" (calls openarm_control, outputs tau_ff).
+"""Start node "trajectory" (q, dq reference) and node "controller" (calls a ct_nlc controller, outputs tau_ff).
 
 Both nodes read every parameter once at start from YAML files:
   openarm_trajectory/config/trajectory.yaml and openarm_controller/config/controller.yaml
