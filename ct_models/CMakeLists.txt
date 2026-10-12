@@ -38,6 +38,7 @@ set(CT_MODELS_LIBRARIES "")
 
 set(IP_CODEGEN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/InvertedPendulum/codegen")
 set(HYA_CODEGEN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/HyA/codegen")
+set(OPENARM_CODEGEN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/OpenArm/codegen")
 set(HYQ_CODEGEN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/HyQ/codegen")
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/CodegenOutputDirs.h.in ${CMAKE_CURRENT_SOURCE_DIR}/include/ct/models/CodegenOutputDirs.h)
 
@@ -178,6 +179,34 @@ if(BUILD_HYA_LINEARIZATION_TIMINGS)
         )
     list(APPEND CT_MODELS_BINARIES HyAcompareForwardReverse)
 endif(BUILD_HYA_LINEARIZATION_TIMINGS)
+
+
+################ OpenArm #################
+## Code generator (Pinocchio + ct::core::DerivativesCppadCG), only where Pinocchio is installed. It rewrites
+## include/ct/models/OpenArm/codegen from urdf/OpenArm; the model itself does not need Pinocchio.
+find_package(pinocchio QUIET)
+if(CPPADCG AND pinocchio_FOUND)
+  add_executable(OpenArmModelCodegen
+    src/OpenArm/codegen/OpenArmModelCodegen.cpp
+    src/OpenArm/codegen/OpenArmPinocchioModel.cpp)
+  target_include_directories(OpenArmModelCodegen PUBLIC ${ct_models_target_include_dirs})
+  target_compile_definitions(OpenArmModelCodegen PRIVATE
+    OPENARM_URDF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/urdf/OpenArm/openarm_v1_bimanual.urdf")
+  target_compile_options(OpenArmModelCodegen PRIVATE -std=c++17)  # Pinocchio
+  target_link_libraries(OpenArmModelCodegen ct_core pinocchio::pinocchio)
+  list(APPEND CT_MODELS_BINARIES OpenArmModelCodegen)
+else()
+  message(STATUS "OpenArmModelCodegen not built (needs Pinocchio and CppADCodeGen); using the committed generated code")
+endif()
+
+## OpenArm model: the generated code (M, C, G of each arm)
+add_library(OpenArmModel
+  include/ct/models/OpenArm/codegen/OpenArmRightModel.cpp
+  include/ct/models/OpenArm/codegen/OpenArmLeftModel.cpp)
+target_include_directories(OpenArmModel PUBLIC ${ct_models_target_include_dirs})
+target_link_libraries(OpenArmModel ct_core)
+set_target_properties(OpenArmModel PROPERTIES POSITION_INDEPENDENT_CODE ON)  # also linkable into shared libraries
+list(APPEND CT_MODELS_LIBRARIES OpenArmModel)
 
 
 ## Declare a cpp library for the ordinary quadrotor

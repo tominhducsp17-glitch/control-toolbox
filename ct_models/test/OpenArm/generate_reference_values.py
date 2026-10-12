@@ -1,10 +1,10 @@
-"""Reference values for the generated OpenArm model, from Pinocchio in double precision (offline).
+"""Reference values for the generated OpenArm model (OpenArmModelTest), from Pinocchio in double precision.
 
 40 random states of both arms (joint order: left J1..J7, right J1..J7; fingers at 0, as in the
 generated model). Each row: q(14) dq(14) ddq(14) M(196, row-major) C(196, row-major) G(14)
 tau_id(14) where tau_id = M ddq + C dq + G (inverse dynamics, RNEA).
 
-    python3 generate_golden.py <official urdf> <output csv>
+    python3 generate_reference_values.py ../../urdf/OpenArm/openarm_v1_bimanual.urdf data/openarm_reference_values.csv
 """
 import sys
 

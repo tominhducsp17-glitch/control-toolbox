@@ -13,6 +13,12 @@
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_EXAMPLES=ON"
       ]
+    },
+    "ct_models": {
+      "cmake-args": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_TESTS=ON"
+      ]
     }
   }
 }

@@ -15,6 +15,12 @@ if(BUILD_TESTS)
     target_include_directories(HyaTest PUBLIC ${ct_models_target_include_dirs})
     target_link_libraries(HyaTest gtest gtest_main ct_rbd HyALinearizedForward)
     
+    package_add_test(OpenArmModelTest OpenArm/OpenArmModelTest.cpp)
+    target_include_directories(OpenArmModelTest PUBLIC ${ct_models_target_include_dirs})
+    target_compile_definitions(OpenArmModelTest PRIVATE
+      OPENARM_REFERENCE_CSV="${CMAKE_CURRENT_SOURCE_DIR}/OpenArm/data/openarm_reference_values.csv")
+    target_link_libraries(OpenArmModelTest gtest gtest_main ct_core OpenArmModel)
+
     package_add_test(ikfast_test_irb IKFast/IKFastTestIrb4600.cpp)
     target_include_directories(ikfast_test_irb PUBLIC ${ct_models_target_include_dirs})
     target_link_libraries(ikfast_test_irb gtest gtest_main irb4600_ik ct_rbd)
