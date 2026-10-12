@@ -1,116 +1,125 @@
 # control-toolbox + OpenArm (branch `openarm-ctc`)
 
 This branch starts from the original [ETH ADRL control-toolbox](https://github.com/ethz-adrl/control-toolbox)
-release `v3.0.2` (commit `7d36e42`, full upstream history kept) and adds the OpenArm control packages, so the
-OpenArm model and controllers live next to the toolbox's own optimal-control solvers (`ct_optcon`: LQR, iLQR/GNMS
-NLOC, MPC, DMS) and can use them directly. The upstream `README.md` is unchanged; this file describes the additions.
+release `v3.0.2` (commit `7d36e42`, full upstream history kept) and adds the OpenArm v1 robot and model-based
+controllers in the toolbox's own structure, so they sit next to its optimal-control solvers (`ct_optcon`: LQR,
+iLQR/GNMS NLOC, MPC, DMS) and can use them directly. The upstream `README.md` is unchanged; this file describes the
+additions.
 
-## What is in this branch
+## Layout
 
-| Path | From | Content |
-| --- | --- | --- |
-| `ct_core`, `ct_optcon` | upstream | built by colcon on ROS 2 Humble (plain CMake packages) |
-| `ct_optcon/examples` | upstream, **re-enabled** | NLOC (iLQR), NLOC_MPC, Kalman filters, constraint output; LQR with CppADCodeGen; DMS and NLP with IPOPT; constrained NLOC with HPIPM |
-| `ct`, `ct_doc`, `ct_rbd`, `ct_models` | upstream | not built yet (`COLCON_IGNORE`): `ct` is a ROS 1 catkin metapackage, `ct_doc` is documentation, `ct_rbd`/`ct_models` need `kindr` and RobCoGen-generated models |
-| `openarm/openarm_codegen` | OpenArm | offline generator: Pinocchio (CppADCodeGen scalar) + `ct::core::DerivativesCppadCG::generateForwardZeroSource` write the model as plain C++ |
-| `openarm/openarm_control` | OpenArm | library, no node, **no Pinocchio at run time**: generated model (`generated/`: M, C, G per arm), `OpenArmModel`, `OpenArmDynamics` (`ct::core::ControlledSystem`), virtual `ControllerBase` with one common input, `ctc_feedforward`, `gravity_compensation`, `CtControllerAdapter` (`ct::core::Controller`) |
-| `openarm/openarm_trajectory` | OpenArm | node `trajectory_node`: plays a trajectory, publishes `joint_commands` (q, dq) |
-| `openarm/openarm_controller` | OpenArm | node `controller_node`: calls the library, publishes `controller/tau_ff`; launch file |
-| `ct/install_deps_ubuntu22.sh` | OpenArm | Ubuntu 22.04: ROS 2 Humble + Pinocchio + IPOPT + the toolbox dependencies pinned as in `ct/install_cppadcg.sh` and `ct/install_hpipm.sh` (CppAD 20200000.3, CppADCodeGen v2.4.3, BLASFEO 0.1.2, HPIPM 0.1.3) + kindr 1.2.0 |
-| `colcon.meta` | OpenArm | builds `ct_core` and `ct_optcon` with their examples; Python plotting of `ct_core` off (its matplotlib bridge fails with matplotlib ≥ 3.5, and the runtime stays Python-free) |
-| `ct_core/CMakeLists.txt` | upstream, **1 fix** | `"${Python_VERSION_MAJOR}"` quoted so CMake configures when Python is disabled |
+| Path | Content |
+| --- | --- |
+| `ct_core`, `ct_optcon`, `ct_rbd` | upstream toolbox (systems, integrators, `ct::core::Controller`; optimal control; rigid-body tools) |
+| `ct_models/include/ct/models/OpenArm` | **OpenArm model**, namespace `ct::models::OpenArm`: `OpenArmModel<NJ>` (M, C, G from generated code, 7 or 14 joints in any order) and `OpenArmSystem<NJ>` (`ct::core::ControlledSystem`) |
+| `ct_models/include/ct/models/OpenArm/codegen` | the generated code: `OpenArmLeftModel`, `OpenArmRightModel` (plain C++, input `[q; dq]`, output M, C, G) and the joint limits |
+| `ct_models/src/OpenArm/codegen` | **code generator module** `OpenArmModelCodegen` (Pinocchio + `ct::core::DerivativesCppadCG`); run only when the URDF changes |
+| `ct_models/urdf/OpenArm` | official OpenArm v1 bimanual URDF |
+| `ct_nlc` | **new package, nonlinear controllers**, namespace `ct::nlc`, at the level of `ct_optcon`: `ModelBasedJointController`, `ComputedTorqueController`, `GravityCompensationController`, `ReferenceAccelerationEstimator` |
+| `ros/openarm_trajectory` | ROS 2 node `trajectory_node`: plays a trajectory file, publishes `joint_commands` (q, dq) at 400 Hz |
+| `ros/openarm_controller` | ROS 2 node `controller_node`: calls a `ct_nlc` controller, publishes `controller/tau_ff`; launch file |
+| `ct/install_deps_ubuntu22.sh` | installs ROS 2 Humble and all dependencies on Ubuntu 22.04 (versions pinned as in `ct/install_cppadcg.sh`, `ct/install_hpipm.sh`) |
+| `colcon.meta` | toolbox build options (tests and examples on; Python plotting of `ct_core` off) |
 
-## Model: generated code (Pinocchio codegen), not RobCoGen
+Changes to upstream files: `ct_core/CMakeLists.txt` (configures with Python disabled), `ct_optcon/examples`
+(examples re-enabled), `ct_optcon/cmake/ct_optconConfig.cmake` (finds BLASFEO/HPIPM in `/opt`),
+`ct_models` (OpenArm added to `CMakeLists.txt`, `CodegenOutputDirs.h.in` and `test/`).
 
-control-toolbox's own model path (`ct_rbd`) needs RobCoGen, which needs a `.kindsl` file (URDF → urdf2robcogen)
-and RobCoGen 0.4 with Maxima. Instead the model is generated from the official URDF with Pinocchio and the toolbox's
-code generator:
+## Model: Pinocchio code generation
 
 ```
-official URDF ──Pinocchio, CppADCodeGen scalar──▶ ct::core::DerivativesCppadCG ──▶ generated/OpenArm{Right,Left}Model.{h,cpp}
-                (openarm_codegen, offline, ~30 ms)                                    input [q; dq] (7+7), output M, C, G
+urdf/OpenArm ──Pinocchio, CppADCodeGen scalar──▶ ct::core::DerivativesCppadCG ──▶ codegen/OpenArm{Left,Right}Model.{h,cpp}
+             (OpenArmModelCodegen, offline, ~30 ms)                                 input [q; dq] (7+7), output M, C, G
 ```
 
-The generated files are plain C++ (straight-line arithmetic, about 1750 lines and 619 temporaries per arm) that
-depend only on Eigen and `ct_core`. They match Pinocchio (double precision) to 1e-9 for M, C, G and inverse dynamics
-on 40 random states; computing M, C, G of both arms at two states plus CTC takes about 6 µs. Regenerate after a URDF
-change:
+The generated files are straight-line C++ that depend only on Eigen and `ct_core`; Pinocchio is not needed to
+build or run the model. They match Pinocchio (double precision) to 1e-9 for M, C, G and inverse dynamics on 40
+random states (`ct_models/test/OpenArm/OpenArmModelTest.cpp`); M, C, G of both arms take about 3 µs.
+
+Regenerate after a URDF change (the generator is built when Pinocchio is installed):
 
 ```bash
-./install/openarm_codegen/lib/openarm_codegen/generate_model openarm/openarm_control/urdf/openarm_v1_bimanual.urdf \
-    openarm/openarm_control/generated
-python3 openarm/openarm_codegen/scripts/generate_golden.py <urdf> openarm/openarm_control/test/data/model_golden.csv  # reference values
+./build/ct_models/OpenArmModelCodegen     # rewrites ct_models/include/ct/models/OpenArm/codegen
+cd ct_models/test/OpenArm && python3 generate_reference_values.py ../../urdf/OpenArm/openarm_v1_bimanual.urdf \
+    data/openarm_reference_values.csv     # reference values for the test
 ```
+
+## Controllers (`ct_nlc`)
+
+All controllers are `ct::core::Controller<2*NJ, NJ>` in the toolbox's form: copy constructor, virtual destructor,
+`clone()` override and `computeControl(x, t, u)` override, so they run in `ct::core` integrators and simulators
+like any toolbox controller.
+
+- `ModelBasedJointController<NJ, MODEL>`: base class. The controller holds its own model (cloned with it), takes the
+  reference with `setReference(q_d, dq_d, ddq_d)`, the state `x = [q; dq]` and time in `computeControl`, evaluates
+  M, C, G with the model and limits the torque (`setTorqueLimit`).
+- `ComputedTorqueController`: `u = M (ddq_d + Kp (q_d - q) + Kd (dq_d - dq)) + C dq* + G`, with the model at the
+  reference or at the measured state. With `Kp = Kd = 0` at the reference it is the feedforward
+  `tau_ff = M(q_d) ddq_d + C(q_d, dq_d) dq_d + G(q_d)` for a motor driver that closes the PD loop itself.
+- `GravityCompensationController`: `u = G(q_d)` or `G(q)`.
+- `ReferenceAccelerationEstimator`: `ddq_d` from a stream of `dq_d` (difference, low-pass, clamp).
+
+Example (`ct_nlc/examples/OpenArmComputedTorque.cpp`): the right arm in simulation follows a 0.5 Hz sine on all
+joints, starting 0.05 rad off; largest `|q_d - q|` after 1 s: 2.5e-5 rad with computed-torque control (Kp 100,
+Kd 20), 0.015 rad with the feedforward plus the driver PD (kp 35, kd 1.2) (exact model, no friction).
+
+```bash
+./build/ct_nlc/examples/ex_OpenArmComputedTorque
+```
+
+### Adding a controller (e.g. MPC)
+
+1. Derive from `ct::nlc::ModelBasedJointController<NJ, MODEL>` (or directly from `ct::core::Controller`),
+   override `computeControl()` and `clone()`, and give it a copy constructor and a virtual destructor
+   (see `PDGravityController` in `ct_nlc/test/ComputedTorqueControllerTest.cpp`).
+2. For the node: add its `controller_type` name in `makeController()` (`ros/openarm_controller/src/controller_node.cpp`)
+   and select it in `controller.yaml`. Topics, the model and the trajectory node stay the same.
+
+For optimal control, `ct::models::OpenArm::OpenArmSystem<NJ>` is the model as a `ct::core::ControlledSystem`
+(`dx = [dq; M^-1 (u - C dq - G)]`), which `ct_optcon` solvers accept.
 
 ## Control architecture
 
 ```mermaid
 flowchart LR
-  REF["Reference<br/>trajectory_node / ACT"] -- "q_d, dq_d" --> NODE
-  ROBOT["Robot driver (MIT)<br/>tau = kp(q_d-q) + kd(dq_d-dq) + tau_ff"] -- "q, dq" --> NODE
-  subgraph NODE["controller_node"]
-    IN["ControllerInput<br/>q, dq, q_d, dq_d, ddq_d"]
+  REF["trajectory_node<br/>(or ACT policy)"] -- "joint_commands: q_d, dq_d" --> NODE
+  ROBOT["robot driver (MIT mode)<br/>tau = kp(q_d - q) + kd(dq_d - dq) + tau_ff"] -- "joint_states: q, dq" --> NODE
+  subgraph NODE["controller_node (ros/openarm_controller)"]
+    EST["ReferenceAccelerationEstimator<br/>ddq_d"]
   end
-  subgraph LIB["openarm_control (library)"]
-    MODEL["OpenArmModel<br/>generated code: M, C, G"]
-    CTRL["ControllerBase (virtual)<br/>computeTorque(input) override:<br/>ctc_feedforward | gravity_compensation | ..."]
+  subgraph NLC["ct_nlc controller (ct::core::Controller)"]
+    CTRL["setReference(q_d, dq_d, ddq_d)<br/>computeControl(x = [q; dq], t, u) override"]
+    MODEL["ct_models OpenArmModel<br/>generated code: M, C, G"]
   end
-  IN -- "q, dq / q_d, dq_d" --> MODEL
-  MODEL -- "M, C, G (measured and reference)" --> IN
-  IN -- "full input" --> CTRL
-  CTRL -- "tau_ff" --> NODE
-  NODE -- "tau_ff" --> ROBOT
+  NODE --> CTRL
+  CTRL <--> MODEL
+  CTRL -- "u = tau_ff" --> NODE
+  NODE -- "controller/tau_ff" --> ROBOT
   REF -- "q_d, dq_d" --> ROBOT
 ```
 
-Every controller receives the same `ControllerInput`: measured `q, dq`, reference `q_d, dq_d, ddq_d`, and the model
-terms `M, C, G` at the measured state (`in.measured`) and at the reference state (`in.reference`). The node computes
-the model once per cycle and calls `controller->compute(in)`.
+Each command: the node sets the reference (`q_d`, `dq_d`, estimated `ddq_d`), builds `x = [q; dq]` from the last
+`joint_states` and calls `controller->computeControl(x, t, u)`; the controller evaluates M, C, G with its model.
+All node parameters are read once at start from `ros/openarm_trajectory/config/trajectory.yaml` and
+`ros/openarm_controller/config/controller.yaml` (no defaults in the code; a missing parameter stops the node with
+its name), so changing a value needs a restart, not a rebuild.
 
 ## Build and test
 
-Ubuntu 22.04 (same as the integration side):
+Ubuntu 22.04:
 
 ```bash
 ./ct/install_deps_ubuntu22.sh        # ROS 2 Humble + all toolbox/OpenArm dependencies (pinned versions)
 source /opt/ros/humble/setup.bash
-colcon build                        # from the repository root; colcon.meta sets the toolbox options
+colcon build                         # from the repository root; colcon.meta sets the toolbox options
 colcon test && colcon test-result --verbose
 ```
-
-Checked on Ubuntu 22.04 (image built by the script): `colcon build` (6 packages), 11/11 tests, all 11 toolbox examples.
-
 
 ## Run
 
 ```bash
 source install/setup.bash
-ros2 launch openarm_controller trajectory_controller.launch.py       # trajectory + CTC feedforward
-./build/ct_optcon/examples/ex_NLOC                                   # toolbox example: iLQR on an oscillator
+ros2 launch openarm_controller trajectory_controller.launch.py     # trajectory + CTC feedforward
+./build/ct_nlc/examples/ex_OpenArmComputedTorque                   # OpenArm with computed-torque control (simulation)
+./build/ct_optcon/examples/ex_NLOC                                 # toolbox example: iLQR on an oscillator
 ```
-
-Toolbox examples checked on this branch (Humble, GCC 11), all run to the end:
-
-| Example | Method | Result printed |
-| --- | --- | --- |
-| `ex_LQR` | LQR, linearization by CppADCodeGen | gain matrix (the example ends with `return 1`) |
-| `ex_NLOC` | iLQR / GNMS (nonlinear optimal control) | final cost 0.208 |
-| `ex_NLOC_MPC` | MPC around NLOC | average solve delay 0.68 ms |
-| `ex_NLOC_boxConstrained`, `ex_NLOC_generalConstrained` | constrained NLOC with HPIPM | final cost 947.1, 249.7 |
-| `ex_DMS`, `ex_Nlp_2D`, `ex_Nlp_3D` | direct multiple shooting / NLP with IPOPT | objective 3.554, −2, −7.071 |
-| `ex_KalmanFiltering`, `ex_KalmanDisturbanceFiltering` | Kalman filters | complete |
-| `ex_ConstraintOutput` | constraint sparsity printout | printed (ends with `return 1`) |
-
-Parameters are read once at start from `openarm/openarm_trajectory/config/trajectory.yaml` and
-`openarm/openarm_controller/config/controller.yaml` (no defaults in the code; a missing parameter stops the node
-with its name).
-
-## Adding a controller (e.g. MPC)
-
-1. Derive from `openarm_control::ControllerBase<NJ>` and override `computeTorque(const ControllerInput<NJ>&)`,
-   `name()` and `clone()` (see `PdPlusGravity` in `openarm_control/test/test_openarm_control.cpp`).
-2. Register the name in `makeController()` (`openarm_control/src/controller.cpp`).
-3. Select it with `controller_type` in `controller.yaml`. Nodes, topics and the model stay the same.
-
-For optimal control, `OpenArmDynamics` is the model as a `ct::core::ControlledSystem` (dx = [dq; M^-1(u - C dq - G)]),
-which `ct_optcon` solvers accept; `CtControllerAdapter` runs any `ControllerBase` inside ct::core simulations.
