@@ -165,7 +165,7 @@ TEST(ControlToolbox, SimulationWithIntegrator)
   for (int j = 1; j <= 7; ++j) {right.push_back("openarm_right_joint" + std::to_string(j));}
   auto system = std::make_shared<OpenArmDynamics<7>>(right);
   auto hold = std::make_shared<CtControllerAdapter<7>>(
-    std::shared_ptr<ControllerBase<7>>(makeController<7>("gravity_compensation")), system->model());
+    std::shared_ptr<ControllerBase<7>>(makeController<7>("gravity_compensation")), OpenArmModel<7>(right));
   JointVector<7> q0;
   q0 << 0.4, 0.1, 0.0, 0.9, 0.0, -0.2, 0.0;
   hold->setReference(q0, JointVector<7>::Zero(), JointVector<7>::Zero());
