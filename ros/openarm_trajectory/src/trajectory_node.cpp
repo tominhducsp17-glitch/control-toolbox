@@ -1,14 +1,15 @@
 // Node 1 "trajectory": plays a joint trajectory and publishes the target positions (the slow source, 100 Hz).
 //
 //   in : joint_states   (sensor_msgs/JointState)  measured pose, used to start from where the arm is
-//   out: joint_commands (sensor_msgs/JointState)  position = q_target, velocity = dq_target, rate_hz
+//   out: joint_commands (sensor_msgs/JointState)  position = q_target only (no velocity), rate_hz; dq_d and
+//                                                  ddq_d come from the controller's reference filter
 //   out: trajectory/phase (std_msgs/String)       wait_state | approach | track | return | hold
 //
 // Plan: wait for joint_states -> quintic approach from the measured pose to the first row (peak speed
 // <= approach_speed) -> the trajectory file -> quintic return to the measured start pose -> hold it.
 // lead_s: every message carries the plan at t + lead_s (targets known ahead, as an action chunk), which cancels
 // the lag ~4 / filter_wn of the controller's reference filter.
-// File: CSV with a header and columns t, q1..qN, dq1..dqN[, ddq1..ddqN] (tools/make_task_trajectory.py).
+// File: CSV with a header and columns t, q1..qN[, dq1..dqN[, ddq1..ddqN]]; only the positions are used.
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -31,7 +32,7 @@ using Vec = Eigen::VectorXd;
 struct Table
 {
   std::vector<double> t;
-  std::vector<Vec> q, dq;
+  std::vector<Vec> q;
 };
 
 Table loadCsv(const std::string & path, std::size_t n)
@@ -47,26 +48,22 @@ Table loadCsv(const std::string & path, std::size_t n)
     std::stringstream in(line);
     std::string cell;
     while (std::getline(in, cell, ',')) {v.push_back(std::stod(cell));}
-    if (v.size() != 1 + 2 * n && v.size() != 1 + 3 * n) {
-      throw std::runtime_error("trajectory row has " + std::to_string(v.size()) + " columns, expected 1 + 2N or 1 + 3N");
+    if (v.size() != 1 + n && v.size() != 1 + 2 * n && v.size() != 1 + 3 * n) {
+      throw std::runtime_error("trajectory row has " + std::to_string(v.size()) + " columns, expected 1 + N, 1 + 2N or 1 + 3N");
     }
     if (!table.t.empty() && !(v[0] > table.t.back())) {throw std::runtime_error("trajectory time must increase");}
     table.t.push_back(v[0]);
     table.q.push_back(Eigen::Map<Vec>(v.data() + 1, static_cast<Eigen::Index>(n)));
-    table.dq.push_back(Eigen::Map<Vec>(v.data() + 1 + n, static_cast<Eigen::Index>(n)));
   }
   if (table.t.empty() || std::abs(table.t.front()) > 1e-9) {throw std::runtime_error("trajectory must start at t = 0");}
   return table;
 }
 
-// Quintic a -> b over T: position and velocity at t.
-void quintic(const Vec & a, const Vec & b, double T, double t, Vec & q, Vec & dq)
+// Quintic a -> b over T: position at t.
+Vec quintic(const Vec & a, const Vec & b, double T, double t)
 {
   const double s = std::clamp(t / T, 0.0, 1.0);
-  const double blend = s * s * s * (10 - 15 * s + 6 * s * s);
-  const double dblend = 30 * s * s * (1 - s) * (1 - s) / T;
-  q = a + blend * (b - a);
-  dq = dblend * (b - a);
+  return a + s * s * s * (10 - 15 * s + 6 * s * s) * (b - a);
 }
 
 double quinticDuration(const Vec & a, const Vec & b, double speed, double min_s)
@@ -145,28 +142,25 @@ private:
   {
     if (phase_ == "wait_state") {return;}
     double t = (now() - phase_start_).seconds() + lead_s_;
-    Vec q, dq;
+    Vec q;
     if (phase_ == "approach" && t >= approach_s_) {next("track", t, approach_s_);}
     if (phase_ == "track" && t > table_.t.back()) {next(return_to_start_ ? "return" : "hold", t, table_.t.back());}
     if (phase_ == "return" && t >= return_s_) {next("hold", t, return_s_);}
     if (phase_ == "approach") {
-      quintic(start_, table_.q.front(), approach_s_, t, q, dq);
+      q = quintic(start_, table_.q.front(), approach_s_, t);
     } else if (phase_ == "track") {
       const auto it = std::upper_bound(table_.t.begin(), table_.t.end(), t + 1e-9);
       const std::size_t k = static_cast<std::size_t>(std::distance(table_.t.begin(), it)) - 1;
       q = table_.q[k];
-      dq = table_.dq[k];
     } else if (phase_ == "return") {
-      quintic(table_.q.back(), start_, return_s_, t, q, dq);
+      q = quintic(table_.q.back(), start_, return_s_, t);
     } else {
       q = return_to_start_ ? start_ : table_.q.back();
-      dq = Vec::Zero(q.size());
     }
     sensor_msgs::msg::JointState msg;
     msg.header.stamp = now();
     msg.name = joints_;
     msg.position.assign(q.data(), q.data() + q.size());
-    msg.velocity.assign(dq.data(), dq.data() + dq.size());
     command_pub_->publish(msg);
   }
 

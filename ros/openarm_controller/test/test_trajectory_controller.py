@@ -2,7 +2,7 @@
 
 The controller starts with bus "sim" (SimBus: ct_models OpenArm model with the friction measured on the robot),
 enables, publishes joint_states; the trajectory node reads the start pose and goes approach -> track -> return
--> hold, publishing joint_commands at about 100 Hz. Checked while running: command rate, the arm follows the
+-> hold, publishing joint_commands (positions only) at about 100 Hz. Checked while running: command rate, the arm follows the
 trajectory (q of joint_states against the commands), the reference q_d is published. Checked after the launch
 ends (SIGINT): the controller returned to its start pose, disabled, exited 0 and wrote its log.
 """
@@ -31,17 +31,16 @@ LOG_DIR = tempfile.mkdtemp()
 
 
 def write_trajectory() -> str:
-    """hold 0.5 s, 2 s quintic hang -> goal, hold 1 s; 100 Hz rows t, q1..7, dq1..7."""
+    """hold 0.5 s, 2 s quintic hang -> goal, hold 1 s; 100 Hz rows t, q1..7 (positions only)."""
     path = os.path.join(tempfile.mkdtemp(), "test_trajectory_100hz.csv")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("t," + ",".join(f"q{j}" for j in range(1, 8)) + "," + ",".join(f"dq{j}" for j in range(1, 8)) + "\n")
+        f.write("t," + ",".join(f"q{j}" for j in range(1, 8)) + "\n")
         for k in range(351):
             t = k / 100.0
             s = min(max((t - 0.5) / 2.0, 0.0), 1.0)
-            b, db = s**3 * (10 - 15 * s + 6 * s * s), 30 * s * s * (1 - s) ** 2 / 2.0
+            b = s**3 * (10 - 15 * s + 6 * s * s)
             q = [h + b * (g - h) for h, g in zip(HANG, GOAL)]
-            dq = [db * (g - h) if 0.0 < s < 1.0 else 0.0 for h, g in zip(HANG, GOAL)]
-            f.write(",".join(f"{v:.9g}" for v in [t] + q + dq) + "\n")
+            f.write(",".join(f"{v:.9g}" for v in [t] + q) + "\n")
     return path
 
 
@@ -91,6 +90,9 @@ class TestTrajectoryController(unittest.TestCase):
         rate = (len(stamps) - 1) / (stamps[-1] - stamps[0])
         self.assertGreater(rate, 80.0, f"joint_commands at {rate:.0f} Hz")
         self.assertLess(rate, 120.0, f"joint_commands at {rate:.0f} Hz")
+        self.assertEqual(list(commands[-1][1].name), RIGHT)
+        self.assertEqual(len(commands[-1][1].position), 7)
+        self.assertEqual(len(commands[-1][1].velocity), 0)  # positions only: dq_d comes from the filter
         self.assertEqual(list(states[-1][1].name), RIGHT)
         self.assertTrue(references, "no controller/reference")
 

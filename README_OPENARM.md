@@ -16,7 +16,7 @@ additions.
 | `ct_models/src/OpenArm/codegen` | **code generator module** `OpenArmModelCodegen` (Pinocchio + `ct::core::DerivativesCppadCG`); run only when the URDF changes |
 | `ct_models/urdf/OpenArm` | official OpenArm v1 bimanual URDF |
 | `ct_nlc` | **new package, nonlinear controllers**, namespace `ct::nlc`, at the level of `ct_optcon`: `ModelBasedJointController`, `ComputedTorqueController`, `FullComputedTorqueController`, `GravityCompensationController`, `ReferenceFilter`, `ReferenceAccelerationEstimator` |
-| `ros/openarm_trajectory` | ROS 2 node `trajectory_node`: plays a trajectory file, publishes the target positions `joint_commands` at 100 Hz (plan at t + `lead_s`) |
+| `ros/openarm_trajectory` | ROS 2 node `trajectory_node`: plays a trajectory file, publishes only the target positions `joint_commands` (no velocity) at 100 Hz (plan at t + `lead_s`) |
 | `ros/openarm_controller` | ROS 2 node `controller_node`: **the 1 kHz control loop of one arm in one thread with the motor bus inside** (openarm_can on the robot, or a simulated arm): reference filter + full computed-torque control from `ct_nlc`; launch file |
 | `ct/install_deps_ubuntu22.sh` | installs ROS 2 Humble and all dependencies on Ubuntu 22.04 (versions pinned as in `ct/install_cppadcg.sh`, `ct/install_hpipm.sh`) |
 | `colcon.meta` | toolbox build options (tests and examples on; Python plotting of `ct_core` off) |
@@ -103,7 +103,8 @@ flowchart LR
   NODE -- "joint_states, controller/reference (100 Hz)" --> SRC
 ```
 
-The trajectory source only gives positions at 100 Hz. Each 1 ms cycle the controller node takes the newest target,
+The trajectory source only gives positions at 100 Hz (`joint_commands` has no velocity; a file may have only the
+columns t, q1..q7): `dq_d` and `ddq_d` come from the reference filter. Each 1 ms cycle the controller node takes the newest target,
 lets the reference filter produce a smooth `q_d, dq_d, ddq_d`, computes the full computed-torque control with the
 generated model and sends one MIT frame per motor with the driver's position gain at 0, then reads the replies.
 Everything runs in one thread (`spin_some` in the loop, SCHED_FIFO when allowed), so there is no queue or lock

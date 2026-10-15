@@ -1,7 +1,7 @@
 // Node "controller": the 1 kHz control loop of one OpenArm arm with the motor bus inside, one thread.
 //
 //   in : joint_commands (sensor_msgs/JointState)  position = target q (e.g. 100 Hz from the trajectory node);
-//                                                  velocity and effort are not used
+//                                                  positions only: dq_d, ddq_d come from the reference filter
 //   out: joint_states   (sensor_msgs/JointState)  measured q, dq, tau of the arm, state_publish_hz (after the
 //                                                  ramp-in)
 //   out: controller/reference (sensor_msgs/JointState)  q_d, dq_d (position, velocity) and the torque sent
