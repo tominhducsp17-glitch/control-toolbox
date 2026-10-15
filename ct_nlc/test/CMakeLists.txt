@@ -12,6 +12,9 @@ if(BUILD_TESTS)
       OPENARM_REFERENCE_CSV="${CMAKE_CURRENT_SOURCE_DIR}/../../ct_models/test/OpenArm/data/openarm_reference_values.csv")
     target_link_libraries(ComputedTorqueControllerTest gtest gtest_main ct_nlc OpenArmModel)
 
+    package_add_test(FullComputedTorqueControllerTest FullComputedTorqueControllerTest.cpp)
+    target_link_libraries(FullComputedTorqueControllerTest gtest gtest_main ct_nlc OpenArmModel)
+
 
     # Run all unit tests post-build.
     add_custom_target(run_tests DEPENDS ${UNIT_TEST_TARGETS})

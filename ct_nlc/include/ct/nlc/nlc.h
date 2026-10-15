@@ -10,10 +10,14 @@ Licensed under the BSD-2 license (see LICENSE file in main directory)
 
 #include "control/ModelBasedJointController.h"
 #include "control/ComputedTorqueController.h"
+#include "control/FullComputedTorqueController.h"
 #include "control/GravityCompensationController.h"
 #include "utils/ReferenceAccelerationEstimator.h"
+#include "utils/ReferenceFilter.h"
 
 #include "control/ModelBasedJointController-impl.h"
 #include "control/ComputedTorqueController-impl.h"
+#include "control/FullComputedTorqueController-impl.h"
 #include "control/GravityCompensationController-impl.h"
 #include "utils/ReferenceAccelerationEstimator-impl.h"
+#include "utils/ReferenceFilter-impl.h"
