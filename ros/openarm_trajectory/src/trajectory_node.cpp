@@ -1,4 +1,4 @@
-// Node 1 "trajectory": plays a joint trajectory and publishes the reference q, dq.
+// Node 1 "trajectory": plays a joint trajectory and publishes the target positions (the slow source, 100 Hz).
 //
 //   in : joint_states   (sensor_msgs/JointState)  measured pose, used to start from where the arm is
 //   out: joint_commands (sensor_msgs/JointState)  position = q_target, velocity = dq_target, rate_hz
@@ -6,6 +6,8 @@
 //
 // Plan: wait for joint_states -> quintic approach from the measured pose to the first row (peak speed
 // <= approach_speed) -> the trajectory file -> quintic return to the measured start pose -> hold it.
+// lead_s: every message carries the plan at t + lead_s (targets known ahead, as an action chunk), which cancels
+// the lag ~4 / filter_wn of the controller's reference filter.
 // File: CSV with a header and columns t, q1..qN, dq1..dqN[, ddq1..ddqN] (tools/make_task_trajectory.py).
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -87,6 +89,8 @@ public:
     approach_speed_ = required("approach_speed", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double();
     min_move_s_ = required("min_move_s", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double();
     return_to_start_ = required("return_to_start", rclcpp::ParameterType::PARAMETER_BOOL).as_bool();
+    lead_s_ = required("lead_s", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double();
+    if (!(rate_hz_ > 0.0) || lead_s_ < 0.0) {throw std::invalid_argument("rate_hz must be > 0 and lead_s >= 0");}
     const auto command_topic = required("command_topic", rclcpp::ParameterType::PARAMETER_STRING).as_string();
     const auto state_topic = required("state_topic", rclcpp::ParameterType::PARAMETER_STRING).as_string();
     if (file.empty()) {throw std::invalid_argument("parameter trajectory_file is required");}
@@ -140,7 +144,7 @@ private:
   void onTimer()
   {
     if (phase_ == "wait_state") {return;}
-    double t = (now() - phase_start_).seconds();
+    double t = (now() - phase_start_).seconds() + lead_s_;
     Vec q, dq;
     if (phase_ == "approach" && t >= approach_s_) {next("track", t, approach_s_);}
     if (phase_ == "track" && t > table_.t.back()) {next(return_to_start_ ? "return" : "hold", t, table_.t.back());}
@@ -184,7 +188,7 @@ private:
 
   std::vector<std::string> joints_;
   Table table_;
-  double rate_hz_, approach_speed_, min_move_s_;
+  double rate_hz_, approach_speed_, min_move_s_, lead_s_;
   bool return_to_start_;
   std::string phase_;
   rclcpp::Time phase_start_;

@@ -1,15 +1,62 @@
-# Node "controller" (openarm_controller). Joint order follows the official URDF.
+# Node "controller" (openarm_controller): 1 kHz loop of one arm, one thread, motor bus inside.
+# Read once at start: edit, save, restart the node (no rebuild). Values J1..J7.
+#
+# Each cycle: motors (CAN) -> safety -> ct::nlc::ReferenceFilter -> ct::nlc::FullComputedTorqueController -> motors
+#   q_d / target = filter_wn^4 / (s + filter_wn)^4        target = joint_commands position (~100 Hz, held)
+#   tau = M(q) ddq_d + C(q, dq) dq + G(q) + tau_bias + friction_fc tanh(dq_d / friction_v) + friction_fv dq_d
+#       + ctc_kp (q_d - q) + ctc_kd (dq_d - dq) + ki int (q_d - q) (|.| <= integral_limit)
+#   MIT frame: kp = 0, kd = driver_kd, tau            (full CTC: all position feedback on the PC)
+# Gains, correction and friction: tuned on the right arm, 13-14/10/2026 (openarm_control configs/fullctc.yaml);
+# 100 Hz source -> filter wn 60 -> 1 kHz: joint RMSE 3.6 mrad mean on the figure eight, as at 500 Hz with the
+# full-rate file (runs fullctc-100hz-1khz-20261014-114738 and fullctc-20261013-174113).
 /**/controller:
   ros__parameters:
-    joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
-                  openarm_left_joint5, openarm_left_joint6, openarm_left_joint7,
-                  openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
-                  openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
-    controller_type: ctc_feedforward    # ctc_feedforward | gravity_compensation (ct_nlc controllers, see controller_node.cpp makeController)
-    torque_limit: [15.0, 15.0, 10.0, 10.0, 3.0, 3.0, 3.0, 15.0, 15.0, 10.0, 10.0, 3.0, 3.0, 3.0]
-    acceleration_cutoff_hz: 5.0         # low-pass of ddq_target estimated from dq_target
-    max_abs_acceleration: 20.0
-    input_timeout_s: 0.1
+    arm: right                          # left | right (joint names openarm_<arm>_joint1..7)
+    bus: sim                            # can: the robot (openarm_can on can_interface) | sim: simulated arm
+    can_interface: can0
+    rate_hz: 1000.0                     # control loop and CAN command rate
+    state_publish_hz: 100.0             # joint_states and controller/reference
     state_topic: joint_states
     command_topic: joint_commands
-    output_topic: controller/tau_ff
+    input_timeout_s: 0.1                # warn when joint_commands stop (the last target is held)
+
+    # reference filter (ct::nlc::ReferenceFilter): lag ~4 / filter_wn = 67 ms; the trajectory node's lead_s
+    # cancels it. filter_wn / rate_hz <= 0.15.
+    filter_wn: 60.0
+
+    # full CTC (ct::nlc::FullComputedTorqueController)
+    ctc_kp: [100.0, 70.0, 60.0, 60.0, 15.0, 22.0, 25.0]        # [N m/rad]
+    ctc_kd: [5.0, 7.0, 4.8, 4.8, 0.18, 0.42, 0.5]              # [N m s/rad]; J1 >= 6-8 and wrist > 0.5 rang at 500 Hz
+    driver_kp: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]            # must be 0 (checked)
+    driver_kd: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]            # 0..5; 0 = pure torque command
+    tau_bias: [0.41, 0.29, 0.10, 0.21, 0.06, -0.07, 0.08]     # model correction, static gravity check [N m]
+    friction_fc: [0.55, 0.56, 0.46, 1.05, 0.15, 0.07, 0.10]   # Coulomb friction feedforward [N m]
+    friction_fv: [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]          # viscous [N m s/rad]
+    friction_v: 0.02                                          # tanh width [rad/s]
+    ki: [40.0, 30.0, 30.0, 40.0, 0.0, 0.0, 0.0]               # [N m/(rad s)], track phase only
+    integral_limit: [1.0, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0]       # [N m]
+    blend_s: 0.5                        # driver PD <-> full CTC crossfade [s]
+
+    # driver PD (+ model feedforward) for the ramp-in, the hold before the first target and the return
+    hold_kp: [70.0, 70.0, 70.0, 60.0, 35.0, 35.0, 35.0]       # [N m/rad], 0..500
+    hold_kd: [2.75, 2.5, 2.0, 2.0, 1.2, 1.2, 1.2]             # [N m s/rad], 0..5
+    ramp_s: 1.0                         # gains 0 -> 1 after enabling
+    ramp_down_s: 0.5                    # gains 1 -> 0 before disabling
+    return_speed: 0.25                  # Ctrl+C: return to the start pose, peak speed [rad/s]
+    min_move_s: 2.0
+
+    # safety. Torque and speed: manufacturer maxima (URDF effort, velocity of J3/J4) - E-stop in reach.
+    tau_limit: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0]        # clamp of the torque sent [N m]
+    max_speed: 5.445                    # soft stop: |dq| [rad/s]
+    max_error: 0.15                     # soft stop: |q - q_d| [rad]
+    max_age: 0.006                      # hard stop: feedback older than this [s] (1 kHz: ~1 ms)
+    abort_grace_s: 0.3                  # after a soft stop, seconds before speed/error become hard stops
+
+    # log of every cycle (CSV as ctc_track, read by openarm_control tools/plot_*.py); log_dir "" = no log
+    log_dir: ""
+    label: ""                           # run folder name; "" = controller-<bus>-<date>-<time>
+    log_max_s: 300.0                    # rows reserved before the loop (~0.7 kB per row)
+
+    # simulated arm only (bus: sim): joint friction measured on the robot
+    sim_coulomb: [0.57, 0.59, 0.49, 1.04, 0.2, 0.09, 0.12]    # [N m]
+    sim_viscous: [0.59, 0.53, 0.13, 1.94, 0.2, 0.02, 0.19]    # [N m s/rad]

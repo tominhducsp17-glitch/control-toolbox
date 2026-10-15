@@ -1,0 +1,73 @@
+{
+  "name": "hold_cart_posture_100hz",
+  "config": "configs/hold_cart_posture.yaml",
+  "arm": "right",
+  "joint_names": [
+    "openarm_right_joint1",
+    "openarm_right_joint2",
+    "openarm_right_joint3",
+    "openarm_right_joint4",
+    "openarm_right_joint5",
+    "openarm_right_joint6",
+    "openarm_right_joint7"
+  ],
+  "rate_hz": 100.0,
+  "time_scale": 1.0,
+  "duration_s": 7.99,
+  "rows": 800,
+  "phases": [
+    {
+      "label": "hold_cart_posture",
+      "start_s": 0.0,
+      "duration_s": 8.0
+    }
+  ],
+  "max_abs_velocity_rad_s": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "max_abs_acceleration_rad_s2": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "q_min": [
+    0.4,
+    0.1,
+    0.0,
+    1.4,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "q_max": [
+    0.4,
+    0.1,
+    0.0,
+    1.4,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "tcp_min_xyz": [
+    0.477,
+    -0.182,
+    0.588
+  ],
+  "tcp_max_xyz": [
+    0.477,
+    -0.182,
+    0.588
+  ],
+  "self_collisions": [],
+  "problems": []
+}

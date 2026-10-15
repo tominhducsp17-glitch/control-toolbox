@@ -1,0 +1,120 @@
+{
+  "name": "cart_figure8_fast_100hz",
+  "config": "configs/cart_figure8_fast.yaml",
+  "arm": "right",
+  "joint_names": [
+    "openarm_right_joint1",
+    "openarm_right_joint2",
+    "openarm_right_joint3",
+    "openarm_right_joint4",
+    "openarm_right_joint5",
+    "openarm_right_joint6",
+    "openarm_right_joint7"
+  ],
+  "rate_hz": 100.0,
+  "time_scale": 1.0,
+  "duration_s": 22.990000000000002,
+  "rows": 2300,
+  "phases": [
+    {
+      "label": "hold_start",
+      "start_s": 0.0,
+      "duration_s": 3.0
+    },
+    {
+      "label": "figure8_two_laps",
+      "start_s": 3.0,
+      "duration_s": 17.0
+    },
+    {
+      "label": "hold_two_laps",
+      "start_s": 20.0,
+      "duration_s": 3.0
+    }
+  ],
+  "max_abs_velocity_rad_s": [
+    0.2,
+    0.32,
+    0.25,
+    0.715,
+    0.293,
+    0.334,
+    0.746
+  ],
+  "max_abs_acceleration_rad_s2": [
+    0.791,
+    0.492,
+    0.405,
+    2.049,
+    0.639,
+    0.59,
+    1.895
+  ],
+  "q_min": [
+    0.364,
+    0.016,
+    -0.192,
+    1.026,
+    -0.214,
+    -0.229,
+    -0.275
+  ],
+  "q_max": [
+    0.506,
+    0.475,
+    0.151,
+    1.57,
+    0.17,
+    0.234,
+    0.327
+  ],
+  "tcp_min_xyz": [
+    0.474,
+    -0.325,
+    0.545
+  ],
+  "tcp_max_xyz": [
+    0.474,
+    -0.125,
+    0.645
+  ],
+  "self_collisions": [],
+  "problems": [],
+  "kind": "cartesian",
+  "tcp_frame": "openarm_right_hand_tcp",
+  "posture_q": [
+    0.4,
+    0.25,
+    0.0,
+    1.4,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "tcp_start_xyz": [
+    0.4737,
+    -0.2248,
+    0.595
+  ],
+  "tcp_rotation": [
+    [
+      -0.2153,
+      -0.0963,
+      0.9718
+    ],
+    [
+      0.2438,
+      -0.9689,
+      -0.0421
+    ],
+    [
+      0.9456,
+      0.2279,
+      0.2321
+    ]
+  ],
+  "max_tcp_speed_m_s": 0.196,
+  "max_tcp_acceleration_m_s2": 0.4014,
+  "min_jacobian_singular_value": 0.0832,
+  "max_velocity_consistency_error": 2.09e-05
+}

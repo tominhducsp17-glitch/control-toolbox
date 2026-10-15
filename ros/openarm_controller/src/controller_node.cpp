@@ -1,224 +1,312 @@
-// Node 2 "controller": calls a ct_nlc controller (ct::core::Controller with the generated OpenArm
-// model of ct_models) and outputs tau_ff.
+// Node "controller": the 1 kHz control loop of one OpenArm arm with the motor bus inside, one thread.
 //
-//   in : joint_states   (sensor_msgs/JointState)  measured position/velocity
-//   in : joint_commands (sensor_msgs/JointState)  position = q_target, velocity = dq_target
-//   out: controller/tau_ff (sensor_msgs/JointState) effort = tau_ff [N m] for the joints of the command,
-//        stamped with the command's stamp
+//   in : joint_commands (sensor_msgs/JointState)  position = target q (e.g. 100 Hz from the trajectory node);
+//                                                  velocity and effort are not used
+//   out: joint_states   (sensor_msgs/JointState)  measured q, dq, tau of the arm, state_publish_hz (after the
+//                                                  ramp-in)
+//   out: controller/reference (sensor_msgs/JointState)  q_d, dq_d (position, velocity) and the torque sent
+//                                                  (effort), state_publish_hz
 //
-// Each received command (event driven):
-//   1. reference q_d, dq_d and ddq_d (estimated from dq_d): controller->setReference()
-//   2. state x = [q; dq] measured: controller->computeControl(x, t, u)   (override in each controller,
-//      which evaluates M, C, G with its model; chosen by controller_type)
-// Joints of joint_names that a command does not contain (e.g. the other arm) are held at their
-// measured position with zero velocity and get no output.
-#include <ct/models/OpenArm/OpenArm.h>
-#include <ct/nlc/nlc.h>
+// Each cycle (rate_hz, one thread, SCHED_FIFO when allowed):
+//   1. take the newest joint_commands (spin_some)
+//   2. ControlLoop::step(): read the motors -> safety -> ct::nlc::ReferenceFilter (4th order) -> q_d, dq_d, ddq_d
+//      -> ct::nlc::FullComputedTorqueController -> one MIT frame per motor (driver kp = 0)
+//   3. publish joint_states and the reference every rate_hz / state_publish_hz cycles
+//   4. sleep until the next cycle
+// bus: can (openarm_can on can_interface) or sim (SimBus: ct_models OpenArm model with friction).
+// Ctrl+C (SIGINT) once: return to the start pose, ramp down, disable; twice: disable at once. SIGTERM (sent by
+// ros2 launch after its timeout) only ever requests the return.
+// With log_dir set, the run is written to log_dir/<label>/ (log.csv, meta.json) as by ctc_track.
+#include "openarm_controller/control_loop.hpp"
+#include "openarm_controller/sim_bus.hpp"
+#ifdef OPENARM_CONTROLLER_HAVE_CAN
+#include "openarm_controller/openarm_can_bus.hpp"
+#endif
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
-#include <algorithm>
-#include <array>
-#include <cmath>
+#include <sched.h>
+#include <sys/mman.h>
+
+#include <atomic>
+#include <csignal>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
-#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
-template<size_t NJ>
-using JointVector = Eigen::Matrix<double, NJ, 1>;
-template<size_t NJ>
-using Model = ct::models::OpenArm::OpenArmModel<NJ>;
-template<size_t NJ>
-using Controller = ct::nlc::ModelBasedJointController<NJ, Model<NJ>>;
+using openarm_controller::Vec7;
 
-// controller_type -> controller. Register new ct_nlc controllers here.
-template<size_t NJ>
-std::unique_ptr<Controller<NJ>> makeController(const std::string & type, const Model<NJ> & model)
+namespace
 {
-  if (type == "ctc_feedforward") {  // M(q_d) ddq_d + C(q_d, dq_d) dq_d + G(q_d)
-    return std::make_unique<ct::nlc::ComputedTorqueController<NJ, Model<NJ>>>(model);
-  }
-  if (type == "gravity_compensation") {  // G(q_d)
-    return std::make_unique<ct::nlc::GravityCompensationController<NJ, Model<NJ>>>(model);
-  }
-  throw std::invalid_argument("unknown controller_type '" + type + "' (ctc_feedforward | gravity_compensation)");
+std::atomic<int> g_stop_requests{0};
+
+void onSigint(int)
+{
+  g_stop_requests.fetch_add(1);
 }
 
-// Declares a parameter without a default and returns it; throws a clear error when the YAML lacks it.
-rclcpp::Parameter required(rclcpp::Node & node, const std::string & name, rclcpp::ParameterType type)
+void onSigterm(int)
 {
-  node.declare_parameter(name, type);
-  try {
-    rclcpp::Parameter p = node.get_parameter(name);
-    if (p.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET) {throw std::runtime_error("not set");}
-    return p;
-  } catch (const std::exception &) {
-    throw std::invalid_argument("parameter '" + name + "' is missing; load config/controller.yaml (params_file)");
-  }
+  int expected = 0;
+  g_stop_requests.compare_exchange_strong(expected, 1);
 }
 
-template<size_t NJ>
+std::string json(const Vec7 & v)
+{
+  std::ostringstream out;
+  out << '[';
+  for (int j = 0; j < v.size(); ++j) {out << (j ? ", " : "") << v[j];}
+  out << ']';
+  return out.str();
+}
+
+const char * phaseName(openarm_controller::Phase phase)
+{
+  static const char * names[] = {"connect", "ramp", "hold", "track", "return", "ramp down", "stopped", "done"};
+  return names[static_cast<int>(phase)];
+}
+}  // namespace
+
 class ControllerNode : public rclcpp::Node
 {
 public:
-  explicit ControllerNode(const std::vector<std::string> & joints)
-  : Node("controller"), joints_(joints)
+  ControllerNode()
+  : Node("controller")
   {
-    // Every parameter comes from the YAML loaded at start (config/controller.yaml); none has a
-    // default in the code, so changing a value never needs a rebuild.
-    required(*this, "joint_names", rclcpp::ParameterType::PARAMETER_STRING_ARRAY);
-    estimator_ = std::make_unique<ct::nlc::ReferenceAccelerationEstimator<NJ>>(
-      required(*this, "acceleration_cutoff_hz", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double(),
-      required(*this, "max_abs_acceleration", rclcpp::ParameterType::PARAMETER_DOUBLE).as_double());
-    for (const auto & [name, type] : std::vector<std::pair<std::string, rclcpp::ParameterType>>{
-        {"controller_type", rclcpp::ParameterType::PARAMETER_STRING},
-        {"torque_limit", rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY},
-        {"input_timeout_s", rclcpp::ParameterType::PARAMETER_DOUBLE},
-        {"state_topic", rclcpp::ParameterType::PARAMETER_STRING},
-        {"command_topic", rclcpp::ParameterType::PARAMETER_STRING},
-        {"output_topic", rclcpp::ParameterType::PARAMETER_STRING}})
-    {
-      required(*this, name, type);
+    // Every parameter comes from the YAML loaded at start (config/controller.yaml); none has a default in the
+    // code, so changing a value never needs a rebuild.
+    config_.arm = text("arm");
+    config_.rate_hz = number("rate_hz");
+    config_.filter_wn = number("filter_wn");
+    config_.ctc_kp = vec("ctc_kp");
+    config_.ctc_kd = vec("ctc_kd");
+    if (vec("driver_kp").cwiseAbs().maxCoeff() != 0.0) {
+      throw std::invalid_argument("driver_kp must be 0 for every joint (full CTC: the position feedback is on the PC)");
     }
-    type_ = get_parameter("controller_type").as_string();
-    controller_ = makeController<NJ>(type_, Model<NJ>(joints_));
-    const auto limit = get_parameter("torque_limit").as_double_array();
-    if (limit.size() != NJ) {throw std::invalid_argument("torque_limit must have one value per joint");}
-    controller_->setTorqueLimit(Eigen::Map<const JointVector<NJ>>(limit.data()));
-    timeout_s_ = get_parameter("input_timeout_s").as_double();
-    for (std::size_t j = 0; j < NJ; ++j) {index_[joints_[j]] = j;}
-    q_meas_.setZero();
-    dq_meas_.setZero();
+    config_.driver_kd = vec("driver_kd");
+    config_.tau_bias = vec("tau_bias");
+    config_.friction_fc = vec("friction_fc");
+    config_.friction_fv = vec("friction_fv");
+    config_.friction_v = number("friction_v");
+    config_.ki = vec("ki");
+    config_.integral_limit = vec("integral_limit");
+    config_.blend_s = number("blend_s");
+    config_.hold_kp = vec("hold_kp");
+    config_.hold_kd = vec("hold_kd");
+    config_.ramp_s = number("ramp_s");
+    config_.ramp_down_s = number("ramp_down_s");
+    config_.return_speed = number("return_speed");
+    config_.min_move_s = number("min_move_s");
+    config_.tau_limit = vec("tau_limit");
+    config_.max_error = number("max_error");
+    config_.max_speed = number("max_speed");
+    config_.max_age = number("max_age");
+    config_.abort_grace_s = number("abort_grace_s");
+    config_.log_max_s = number("log_max_s");
+    bus_type_ = text("bus");
+    const std::string iface = text("can_interface");
+    const Vec7 sim_coulomb = vec("sim_coulomb");
+    const Vec7 sim_viscous = vec("sim_viscous");
+    const double publish_hz = number("state_publish_hz");
+    input_timeout_s_ = number("input_timeout_s");
+    log_dir_ = text("log_dir");
+    label_ = text("label");
+    for (int j = 1; j <= openarm_controller::kJoints; ++j) {
+      joints_.push_back("openarm_" + config_.arm + "_joint" + std::to_string(j));
+    }
 
-    tau_pub_ = create_publisher<sensor_msgs::msg::JointState>(
-      get_parameter("output_topic").as_string(), rclcpp::QoS(10));
-    state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      get_parameter("state_topic").as_string(), rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::JointState & m) {onState(m);});
+    if (bus_type_ == "sim") {
+      openarm_controller::SimBusOptions options;
+      options.arm = config_.arm;
+      options.cycle_s = 1.0 / config_.rate_hz;
+      options.coulomb_nm = sim_coulomb;
+      options.viscous_nms = sim_viscous;
+      bus_ = std::make_unique<openarm_controller::SimBus>(options);
+    } else if (bus_type_ == "can") {
+#ifdef OPENARM_CONTROLLER_HAVE_CAN
+      bus_ = std::make_unique<openarm_controller::OpenArmCanBus>(iface);
+#else
+      throw std::invalid_argument("bus 'can': built without openarm_can (install it and rebuild)");
+#endif
+    } else {
+      throw std::invalid_argument("bus must be can or sim");
+    }
+    loop_ = std::make_unique<openarm_controller::ControlLoop>(*bus_, config_);
+    publish_every_ = std::max(1, static_cast<int>(std::lround(config_.rate_hz / publish_hz)));
+
+    state_pub_ = create_publisher<sensor_msgs::msg::JointState>(text("state_topic"), rclcpp::QoS(10));
+    reference_pub_ = create_publisher<sensor_msgs::msg::JointState>("controller/reference", rclcpp::QoS(10));
     command_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      get_parameter("command_topic").as_string(), rclcpp::SensorDataQoS(),
+      text("command_topic"), rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::JointState & m) {onCommand(m);});
-    watchdog_ = create_wall_timer(std::chrono::milliseconds(10), [this] {onWatchdog();});
-    RCLCPP_INFO(get_logger(), "controller '%s' (ct_nlc), %zu joints, model: ct_models OpenArm (generated code)",
-      type_.c_str(), NJ);
+  }
+
+  // The control loop until the motors are disabled; returns the process exit code.
+  int run()
+  {
+    sched_param sp{};
+    sp.sched_priority = 80;
+    fifo_ = bus_->realtime() && sched_setscheduler(0, SCHED_FIFO, &sp) == 0;
+    if (bus_->realtime()) {mlockall(MCL_CURRENT | MCL_FUTURE);}
+    RCLCPP_INFO(get_logger(), "arm %s, bus %s, %.0f Hz%s, reference filter wn %.0f rad/s, full CTC (ct_nlc)",
+      config_.arm.c_str(), bus_type_.c_str(), config_.rate_hz, fifo_ ? " (SCHED_FIFO)" : "", config_.filter_wn);
+    if (!loop_->start()) {
+      RCLCPP_ERROR(get_logger(), "%s", loop_->reason().c_str());
+      return 2;
+    }
+    RCLCPP_INFO(get_logger(), "motors enabled; following %s (Ctrl+C: return to the start pose and disable)",
+      command_sub_->get_topic_name());
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(shared_from_this());
+    int handled_stops = 0;
+    long cycle = 0;
+    openarm_controller::Phase last_phase = loop_->phase();
+    bool stale_input = false;
+    for (;;) {
+      executor.spin_some(std::chrono::nanoseconds(0));
+      for (; handled_stops < g_stop_requests.load(); ++handled_stops) {loop_->requestStop();}
+      if (!loop_->step()) {break;}
+      if (loop_->phase() != last_phase) {
+        last_phase = loop_->phase();
+        RCLCPP_INFO(get_logger(), "phase: %s %s", phaseName(last_phase), loop_->reason().c_str());
+      }
+      const bool stale = loop_->phase() == openarm_controller::Phase::kTrack &&
+        loop_->secondsSinceTarget() > input_timeout_s_;
+      if (stale && !stale_input) {
+        RCLCPP_WARN(get_logger(), "no joint_commands for %.3f s: holding the last target", input_timeout_s_);
+      }
+      stale_input = stale;
+      // joint_states only once the gains are ramped in: the trajectory node starts its approach from the first
+      // joint_states, so its first targets are the current pose and the reference filter starts at rest
+      if (++cycle % publish_every_ == 0 && loop_->phase() != openarm_controller::Phase::kRamp) {publish();}
+      loop_->waitNextCycle();
+    }
+    RCLCPP_INFO(get_logger(), "%s %s; overruns %d, clamped cycles %d", loop_->status().c_str(),
+      loop_->reason().c_str(), loop_->overruns(), loop_->clampedCycles());
+    writeRun();
+    return loop_->status() == "completed" ? 0 : 1;
   }
 
 private:
-  void onState(const sensor_msgs::msg::JointState & msg)
+  // Declares a parameter without a default; throws a clear error when the YAML lacks it.
+  rclcpp::Parameter required(const std::string & name, rclcpp::ParameterType type)
   {
-    if (msg.position.size() != msg.name.size()) {return;}
-    for (std::size_t k = 0; k < msg.name.size(); ++k) {
-      const auto it = index_.find(msg.name[k]);
-      if (it == index_.end()) {continue;}  // fingers: fixed at 0 in the generated model
-      if (!std::isfinite(msg.position[k])) {continue;}
-      q_meas_[it->second] = msg.position[k];
-      dq_meas_[it->second] = msg.velocity.size() == msg.name.size() ? msg.velocity[k] : 0.0;
-      measured_[it->second] = true;
+    declare_parameter(name, type);
+    rclcpp::Parameter p = get_parameter(name);
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET) {
+      throw std::invalid_argument("parameter '" + name + "' is missing; load config/controller.yaml (params_file)");
     }
+    return p;
+  }
+  std::string text(const std::string & name)
+  {
+    return required(name, rclcpp::ParameterType::PARAMETER_STRING).as_string();
+  }
+  double number(const std::string & name)
+  {
+    return required(name, rclcpp::ParameterType::PARAMETER_DOUBLE).as_double();
+  }
+  Vec7 vec(const std::string & name)
+  {
+    const auto v = required(name, rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY).as_double_array();
+    if (v.size() != openarm_controller::kJoints) {throw std::invalid_argument(name + " needs 7 values (J1..J7)");}
+    return Eigen::Map<const Vec7>(v.data());
   }
 
   void onCommand(const sensor_msgs::msg::JointState & msg)
   {
-    if (msg.position.size() != msg.name.size()) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "joint_commands without positions");
-      return;
-    }
-    const bool has_velocity = msg.velocity.size() == msg.name.size();
-    if (!has_velocity) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "joint_commands without velocity; dq_target = 0");
-    }
-    JointVector<NJ> q_d = q_meas_;  // joints without a command hold their measured pose
-    JointVector<NJ> dq_d = JointVector<NJ>::Zero();
-    std::vector<std::size_t> commanded;
-    for (std::size_t k = 0; k < msg.name.size(); ++k) {
-      const auto it = index_.find(msg.name[k]);
-      if (it == index_.end()) {continue;}
-      q_d[it->second] = msg.position[k];
-      dq_d[it->second] = has_velocity ? msg.velocity[k] : 0.0;
-      commanded.push_back(it->second);
-    }
-    if (commanded.empty()) {return;}
-    for (std::size_t j = 0; j < NJ; ++j) {
-      const bool in_command = std::find(commanded.begin(), commanded.end(), j) != commanded.end();
-      if (!in_command && !measured_[j]) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "%s has neither a command nor a measurement yet; tau_ff not computed", joints_[j].c_str());
+    if (msg.position.size() != msg.name.size()) {return;}
+    std::map<std::string, double> by_name;
+    for (std::size_t k = 0; k < msg.name.size(); ++k) {by_name[msg.name[k]] = msg.position[k];}
+    Vec7 q;
+    for (int j = 0; j < openarm_controller::kJoints; ++j) {
+      const auto it = by_name.find(joints_[static_cast<std::size_t>(j)]);
+      if (it == by_name.end()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "joint_commands without %s: ignored",
+          joints_[static_cast<std::size_t>(j)].c_str());
         return;
       }
+      q[j] = it->second;
     }
-    const bool stamped = msg.header.stamp.sec != 0 || msg.header.stamp.nanosec != 0;
-    const double t = stamped ? rclcpp::Time(msg.header.stamp).seconds() : now().seconds();
-    try {
-      controller_->setReference(q_d, dq_d, estimator_->update(t, dq_d));
-      ct::core::StateVector<2 * NJ> x;
-      x << q_meas_, dq_meas_;
-      ct::core::ControlVector<NJ> u;
-      controller_->computeControl(x, t, u);  // override of ct::core::Controller
-      sensor_msgs::msg::JointState out;
-      out.header.stamp = stamped ? msg.header.stamp : builtin_interfaces::msg::Time(now());
-      for (const auto j : commanded) {
-        out.name.push_back(joints_[j]);
-        out.effort.push_back(u[j]);
-      }
-      tau_pub_->publish(out);
-      last_command_ = now();
-      timed_out_ = false;
-      if (controller_->lastControlSaturated()) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "tau_ff clamped by torque_limit");
-      }
-    } catch (const std::invalid_argument & e) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "command rejected: %s", e.what());
-    }
+    loop_->setTarget(q);
   }
 
-  void onWatchdog()
+  void publish()
   {
-    if (!last_command_ || timed_out_ || (now() - *last_command_).seconds() <= timeout_s_) {return;}
-    timed_out_ = true;
-    estimator_->reset();
-    RCLCPP_WARN(get_logger(), "no joint_commands for %.3f s", timeout_s_);
+    const auto & s = loop_->state();
+    const auto & r = loop_->lastRow();
+    sensor_msgs::msg::JointState state, reference;
+    state.header.stamp = reference.header.stamp = now();
+    state.name = reference.name = joints_;
+    state.position.assign(s.q.data(), s.q.data() + openarm_controller::kJoints);
+    state.velocity.assign(s.dq.data(), s.dq.data() + openarm_controller::kJoints);
+    state.effort.assign(s.tau.data(), s.tau.data() + openarm_controller::kJoints);
+    reference.position.assign(r.q_d.data(), r.q_d.data() + openarm_controller::kJoints);
+    reference.velocity.assign(r.dq_d.data(), r.dq_d.data() + openarm_controller::kJoints);
+    reference.effort.assign(r.tau_sent.data(), r.tau_sent.data() + openarm_controller::kJoints);
+    state_pub_->publish(state);
+    reference_pub_->publish(reference);
   }
 
-  std::vector<std::string> joints_;
-  std::map<std::string, std::size_t> index_;
-  std::string type_;
-  std::unique_ptr<Controller<NJ>> controller_;
-  std::unique_ptr<ct::nlc::ReferenceAccelerationEstimator<NJ>> estimator_;
-  JointVector<NJ> q_meas_, dq_meas_;
-  std::array<bool, NJ> measured_{};
-  double timeout_s_;
-  std::optional<rclcpp::Time> last_command_;
-  bool timed_out_ = false;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr tau_pub_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr state_sub_, command_sub_;
-  rclcpp::TimerBase::SharedPtr watchdog_;
-};
+  void writeRun()
+  {
+    if (log_dir_.empty() || loop_->log().empty()) {return;}
+    std::string label = label_;
+    if (label.empty()) {
+      char stamp[32];
+      const std::time_t now_t = std::time(nullptr);
+      std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now_t));
+      label = "controller-" + bus_type_ + "-" + stamp;
+    }
+    const std::filesystem::path dir = std::filesystem::path(log_dir_) / label;
+    std::filesystem::create_directories(dir);
+    loop_->writeLog((dir / "log.csv").string());
+    std::ofstream meta(dir / "meta.json");
+    meta << "{\n  \"label\": \"" << label << "\", \"node\": \"openarm_controller/controller_node\",\n"
+         << "  \"mode\": \"" << (bus_type_ == "sim" ? "sim" : "hardware") << "\", \"arm\": \"" << config_.arm
+         << "\", \"rate_hz\": " << config_.rate_hz << ", \"sched_fifo\": " << (fifo_ ? "true" : "false") << ",\n"
+         << "  \"filter_wn\": " << config_.filter_wn << ",\n"
+         << "  \"ctc_kp\": " << json(config_.ctc_kp) << ", \"ctc_kd\": " << json(config_.ctc_kd)
+         << ", \"driver_kp\": [0, 0, 0, 0, 0, 0, 0], \"driver_kd\": " << json(config_.driver_kd) << ",\n"
+         << "  \"tau_bias\": " << json(config_.tau_bias) << ", \"friction_fc\": " << json(config_.friction_fc)
+         << ", \"friction_fv\": " << json(config_.friction_fv) << ", \"friction_v\": " << config_.friction_v << ",\n"
+         << "  \"ki\": " << json(config_.ki) << ", \"integral_limit\": " << json(config_.integral_limit) << ",\n"
+         << "  \"tau_limit\": " << json(config_.tau_limit) << ", \"max_error\": " << config_.max_error
+         << ", \"max_speed\": " << config_.max_speed << ", \"max_age\": " << config_.max_age << ",\n"
+         << "  \"status\": \"" << loop_->status() << "\", \"reason\": \"" << loop_->reason() << "\",\n"
+         << "  \"overruns\": " << loop_->overruns() << ", \"clamped_cycles\": " << loop_->clampedCycles()
+         << ", \"rows\": " << loop_->log().size() << "\n}\n";
+    RCLCPP_INFO(get_logger(), "-> %s", dir.c_str());
+  }
 
-std::vector<std::string> jointNamesParameter()
-{
-  // Short-lived node with the same name, so the YAML for "controller" applies to it.
-  auto probe = std::make_shared<rclcpp::Node>("controller");
-  return required(*probe, "joint_names", rclcpp::ParameterType::PARAMETER_STRING_ARRAY).as_string_array();
-}
+  openarm_controller::LoopConfig config_;
+  std::string bus_type_, log_dir_, label_;
+  std::vector<std::string> joints_;
+  double input_timeout_s_ = 0.0;
+  int publish_every_ = 1;
+  bool fifo_ = false;
+  std::unique_ptr<openarm_controller::ArmBus> bus_;
+  std::unique_ptr<openarm_controller::ControlLoop> loop_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_, reference_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr command_sub_;
+};
 
 int main(int argc, char ** argv)
 {
-  rclcpp::init(argc, argv);
+  // own signal handling: Ctrl+C must not end the loop, only request the return (once) or the disable (twice)
+  rclcpp::init(argc, argv, rclcpp::InitOptions(), rclcpp::SignalHandlerOptions::None);
+  std::signal(SIGINT, onSigint);
+  std::signal(SIGTERM, onSigterm);
   int code = 0;
   try {
-    const auto joints = jointNamesParameter();
-    std::shared_ptr<rclcpp::Node> node;
-    if (joints.size() == 7) {
-      node = std::make_shared<ControllerNode<7>>(joints);
-    } else if (joints.size() == 14) {
-      node = std::make_shared<ControllerNode<14>>(joints);
-    } else {
-      throw std::invalid_argument("joint_names must list 7 (one arm) or 14 (both arms) joints");
-    }
-    rclcpp::spin(node);
+    auto node = std::make_shared<ControllerNode>();
+    code = node->run();
   } catch (const std::exception & e) {
     RCLCPP_FATAL(rclcpp::get_logger("controller"), "%s", e.what());
     code = 1;

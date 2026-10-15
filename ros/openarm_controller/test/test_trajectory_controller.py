@@ -1,12 +1,13 @@
-"""Integration test: node "trajectory" + node "controller" over real ROS 2 topics.
+"""Integration test: node "trajectory" (100 Hz) + node "controller" (1 kHz, simulated arm) over ROS 2 topics.
 
-A fake robot publishes joint_states (both arms hanging) at 200 Hz. The trajectory node must read the
-start pose and go approach -> track -> return -> hold, publishing joint_commands (q, dq) at about
-400 Hz. The controller node must answer each command with tau_ff for exactly the 7 commanded joints,
-with the command's stamp, finite and inside torque_limit; in hold (dq = 0) the right shoulder torque
-must equal gravity, which a second controller node of type gravity_compensation provides.
+The controller starts with bus "sim" (SimBus: ct_models OpenArm model with the friction measured on the robot),
+enables, publishes joint_states; the trajectory node reads the start pose and goes approach -> track -> return
+-> hold, publishing joint_commands at about 100 Hz. Checked while running: command rate, the arm follows the
+trajectory (q of joint_states against the commands), the reference q_d is published. Checked after the launch
+ends (SIGINT): the controller returned to its start pose, disabled, exited 0 and wrote its log.
 """
 
+import json
 import math
 import os
 import tempfile
@@ -17,33 +18,31 @@ from ament_index_python.packages import get_package_share_directory
 import launch
 import launch_ros.actions
 import launch_testing.actions
+import launch_testing.asserts
 import pytest
 import rclpy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
 RIGHT = [f"openarm_right_joint{j}" for j in range(1, 8)]
-LEFT = [f"openarm_left_joint{j}" for j in range(1, 8)]
-HANG = [0.0, 0.0, 0.0, 0.15, 0.0, 0.0, 0.0]
+HANG = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]
+GOAL = [0.4, 0.25, 0.0, 1.0, 0.0, 0.1, 0.0]
+LOG_DIR = tempfile.mkdtemp()
 
 
 def write_trajectory() -> str:
-    """1.5 s quintic of the right arm from the hanging pose, 400 Hz rows: t, q1..7, dq1..7."""
-    goal = [0.3, 0.1, 0.0, 0.6, 0.0, 0.1, 0.0]
-    path = os.path.join(tempfile.mkdtemp(), "test_trajectory.csv")
+    """hold 0.5 s, 2 s quintic hang -> goal, hold 1 s; 100 Hz rows t, q1..7, dq1..7."""
+    path = os.path.join(tempfile.mkdtemp(), "test_trajectory_100hz.csv")
     with open(path, "w", encoding="utf-8") as f:
         f.write("t," + ",".join(f"q{j}" for j in range(1, 8)) + "," + ",".join(f"dq{j}" for j in range(1, 8)) + "\n")
-        for k in range(601):
-            t = k / 400.0
-            s = t / 1.5
-            b, db = s**3 * (10 - 15 * s + 6 * s * s), 30 * s * s * (1 - s) ** 2 / 1.5
-            q = [h + b * (g - h) for h, g in zip(HANG, goal)]
-            dq = [db * (g - h) for h, g in zip(HANG, goal)]
+        for k in range(351):
+            t = k / 100.0
+            s = min(max((t - 0.5) / 2.0, 0.0), 1.0)
+            b, db = s**3 * (10 - 15 * s + 6 * s * s), 30 * s * s * (1 - s) ** 2 / 2.0
+            q = [h + b * (g - h) for h, g in zip(HANG, GOAL)]
+            dq = [db * (g - h) if 0.0 < s < 1.0 else 0.0 for h, g in zip(HANG, GOAL)]
             f.write(",".join(f"{v:.9g}" for v in [t] + q + dq) + "\n")
     return path
-
-
-CONTROLLER_YAML = get_package_share_directory("openarm_controller") + "/config/controller.yaml"
 
 
 @pytest.mark.launch_test
@@ -51,15 +50,15 @@ def generate_test_description():
     trajectory = launch_ros.actions.Node(
         package="openarm_trajectory", executable="trajectory_node", name="trajectory", output="screen",
         parameters=[get_package_share_directory("openarm_trajectory") + "/config/trajectory.yaml",
-                    {"trajectory_file": write_trajectory(), "min_move_s": 0.5, "approach_speed": 1.0}])
-    ctc = launch_ros.actions.Node(
+                    {"trajectory_file": write_trajectory(), "min_move_s": 1.0, "approach_speed": 1.0}])
+    controller = launch_ros.actions.Node(
         package="openarm_controller", executable="controller_node", name="controller", output="screen",
-        parameters=[CONTROLLER_YAML, {"controller_type": "ctc_feedforward"}])
-    gravity = launch_ros.actions.Node(
-        package="openarm_controller", executable="controller_node", name="controller", output="screen",
-        namespace="gravity", parameters=[CONTROLLER_YAML, {"controller_type": "gravity_compensation"}],
-        remappings=[("joint_states", "/joint_states"), ("joint_commands", "/joint_commands")])
-    return launch.LaunchDescription([trajectory, ctc, gravity, launch_testing.actions.ReadyToTest()])
+        parameters=[get_package_share_directory("openarm_controller") + "/config/controller.yaml",
+                    {"bus": "sim", "log_dir": LOG_DIR, "label": "launch-test", "min_move_s": 1.0,
+                     "return_speed": 1.0}])
+    return launch.LaunchDescription([
+        launch.actions.SetLaunchConfiguration("sigterm_timeout", "30"),
+        trajectory, controller, launch_testing.actions.ReadyToTest()]), {"controller": controller}
 
 
 class TestTrajectoryController(unittest.TestCase):
@@ -72,28 +71,14 @@ class TestTrajectoryController(unittest.TestCase):
         rclpy.shutdown()
 
     def test_pipeline(self):
-        node = rclpy.create_node("fake_robot")
-        commands, taus, gravity, phases = [], {}, {}, []
-        node.create_subscription(JointState, "joint_commands",
-                                 lambda m: commands.append((time.monotonic(), m)), 50)
-        node.create_subscription(JointState, "controller/tau_ff",
-                                 lambda m: taus.__setitem__((m.header.stamp.sec, m.header.stamp.nanosec), m), 50)
-        node.create_subscription(JointState, "/gravity/controller/tau_ff",
-                                 lambda m: gravity.__setitem__((m.header.stamp.sec, m.header.stamp.nanosec), m), 50)
+        node = rclpy.create_node("observer")
+        commands, states, references, phases = [], [], [], []
+        node.create_subscription(JointState, "joint_commands", lambda m: commands.append((time.monotonic(), m)), 50)
+        node.create_subscription(JointState, "joint_states", lambda m: states.append((time.monotonic(), m)), 50)
+        node.create_subscription(JointState, "controller/reference", lambda m: references.append(m), 50)
         qos = rclpy.qos.QoSProfile(depth=10, durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL)
         node.create_subscription(String, "trajectory/phase", lambda m: phases.append(m.data), qos)
-        state_pub = node.create_publisher(JointState, "joint_states", 10)
-
-        def publish_state():
-            msg = JointState()
-            msg.header.stamp = node.get_clock().now().to_msg()
-            msg.name = LEFT + RIGHT
-            msg.position = HANG + HANG
-            msg.velocity = [0.0] * 14
-            state_pub.publish(msg)
-
-        node.create_timer(0.005, publish_state)
-        deadline = time.monotonic() + 40.0
+        deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline and "hold" not in phases:
             rclpy.spin_once(node, timeout_sec=0.01)
         end = time.monotonic() + 1.0
@@ -102,32 +87,36 @@ class TestTrajectoryController(unittest.TestCase):
         node.destroy_node()
 
         self.assertEqual(phases[:5], ["wait_state", "approach", "track", "return", "hold"], phases)
-        self.assertGreater(len(commands), 400)
-        stamps = [t for t, _ in commands[-200:]]
+        stamps = [t for t, _ in commands[-100:]]
         rate = (len(stamps) - 1) / (stamps[-1] - stamps[0])
-        self.assertGreater(rate, 300.0, f"joint_commands at {rate:.0f} Hz")
-        first = commands[0][1]
-        self.assertEqual(list(first.name), RIGHT)
-        self.assertEqual(len(first.velocity), 7)
+        self.assertGreater(rate, 80.0, f"joint_commands at {rate:.0f} Hz")
+        self.assertLess(rate, 120.0, f"joint_commands at {rate:.0f} Hz")
+        self.assertEqual(list(states[-1][1].name), RIGHT)
+        self.assertTrue(references, "no controller/reference")
 
-        matched = 0
-        for _, cmd in commands:
-            key = (cmd.header.stamp.sec, cmd.header.stamp.nanosec)
-            if key not in taus:
-                continue
-            matched += 1
-            tau = taus[key]
-            self.assertEqual(list(tau.name), RIGHT)
-            self.assertTrue(all(math.isfinite(v) for v in tau.effort))
-            self.assertTrue(all(abs(v) <= lim + 1e-9 for v, lim in zip(tau.effort, [15, 15, 10, 10, 3, 3, 3])))
-        self.assertGreater(matched, 0.9 * len(commands), "controller answered too few commands")
+        # the measured q follows the reference q_d of the same cycle (both published together, same stamp)
+        refs = {(r.header.stamp.sec, r.header.stamp.nanosec): r for r in references}
+        errors = [max(abs(a - b) for a, b in zip(s.position, refs[k].position))
+                  for _, s in states if (k := (s.header.stamp.sec, s.header.stamp.nanosec)) in refs]
+        self.assertGreater(len(errors), 300)
+        self.assertLess(max(errors), 0.03, f"largest |q - q_d| {max(errors):.4f} rad")
+        # the reference follows the trajectory: at the end of the track phase it is at the goal
+        self.assertLess(min(max(abs(a - g) for a, g in zip(r.position, GOAL)) for r in references), 0.005)
+        # back at the start pose in hold
+        self.assertLess(max(abs(a - b) for a, b in zip(states[-1][1].position, HANG)), 0.02)
 
-        # Hold: dq = 0 and the estimator has settled, so CTC feedforward equals gravity at q_target.
-        # Use the latest hold command answered by both controllers (the newest may still be in flight).
-        held = [(c.header.stamp.sec, c.header.stamp.nanosec) for _, c in commands
-                if all(v == 0.0 for v in c.velocity)]
-        answered = [k for k in held if k in taus and k in gravity]
-        self.assertTrue(answered, "no hold command answered by both controllers")
-        key = answered[-1]
-        for a, b in zip(taus[key].effort, gravity[key].effort):
-            self.assertAlmostEqual(a, b, delta=1e-3)
+
+@launch_testing.post_shutdown_test()
+class TestShutdown(unittest.TestCase):
+    def test_controller_returned_and_disabled(self, proc_info, controller):
+        launch_testing.asserts.assertExitCodes(proc_info, process=controller)  # 0: status completed
+        with open(os.path.join(LOG_DIR, "launch-test", "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        self.assertEqual(meta["status"], "completed", meta["reason"])
+        self.assertEqual(meta["rate_hz"], 1000.0)
+        with open(os.path.join(LOG_DIR, "launch-test", "log.csv"), encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+            rows = [line.split(",") for line in f]
+        phase = header.index("phase")
+        self.assertEqual({int(r[phase]) for r in rows} >= {1, 3, 4, 5}, True)  # ramp, track, return, ramp down
+        self.assertTrue(all(math.isfinite(float(v)) for r in rows[-100:] for v in r))

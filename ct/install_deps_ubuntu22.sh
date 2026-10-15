@@ -41,7 +41,8 @@ $SUDO apt-get install -y --no-install-recommends \
   ros-humble-ros-base python3-colcon-common-extensions \
   ros-humble-ament-cmake-gtest ros-humble-launch-testing-ament-cmake \
   ros-humble-pinocchio \
-  liblapack-dev libboost-all-dev coinor-libipopt-dev
+  liblapack-dev libboost-all-dev coinor-libipopt-dev \
+  libcli11-dev can-utils
 
 echo "== 3. CppAD 20200000.3 + CppADCodeGen v2.4.3 (auto-diff and derivative code generation)"
 if [[ ! -f /usr/local/include/cppad/cg.hpp ]]; then
@@ -76,6 +77,13 @@ if [[ ! -d /usr/local/include/kindr ]]; then
   git -C kindr checkout -q 1.2.0
   cmake -S kindr -B kindr-build -DUSE_CMAKE=true -DBUILD_TEST=OFF
   $SUDO cmake --build kindr-build --target install
+fi
+echo "== 6. openarm_can 1.4.0 (CAN-FD driver of the OpenArm motors, used by ros/openarm_controller on the robot)"
+if [[ ! -f /usr/local/lib/cmake/OpenArmCAN/OpenArmCANConfig.cmake ]]; then
+  cd "$BUILD_DIR"
+  git clone -q --depth 1 --branch 1.4.0 https://github.com/enactic/openarm_can.git
+  cmake -S openarm_can -B openarm_can-build -DCMAKE_BUILD_TYPE=Release
+  $SUDO cmake --build openarm_can-build --target install -j"$(nproc)"
 fi
 $SUDO ldconfig
 
